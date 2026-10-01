@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -29,10 +30,40 @@ type Store struct{ root string }
 
 func New(root string) *Store { return &Store{root: root} }
 
-func (s *Store) Init() error {
+// withLock serializes access to the repository across cooperating processes.
+// Mutating operations pass exclusive=true; readers take a shared lock. The
+// lock is an flock on <root>/.lock, so it is released automatically if a
+// process dies mid-operation and nothing can wait forever on a stale lock.
+func (s *Store) withLock(exclusive bool, fn func() error) error {
 	if strings.TrimSpace(s.root) == "" {
 		return errors.New("root is required")
 	}
+	if exclusive {
+		if err := os.MkdirAll(s.root, 0o755); err != nil {
+			return err
+		}
+	}
+	lock, err := os.OpenFile(s.lockPath(), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	mode := syscall.LOCK_SH
+	if exclusive {
+		mode = syscall.LOCK_EX
+	}
+	if err := syscall.Flock(int(lock.Fd()), mode); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+func (s *Store) Init() error {
+	return s.withLock(true, s.initLocked)
+}
+
+func (s *Store) initLocked() error {
 	if err := os.MkdirAll(filepath.Join(s.root, "objects"), 0o755); err != nil {
 		return err
 	}
@@ -50,43 +81,47 @@ func (s *Store) Put(name, source string) (Entry, error) {
 	if source == "" {
 		return Entry{}, errors.New("file is required")
 	}
-	if err := s.Init(); err != nil {
-		return Entry{}, err
-	}
-	in, err := os.Open(source)
-	if err != nil {
-		return Entry{}, err
-	}
-	defer in.Close()
-	tmp, err := os.CreateTemp(filepath.Join(s.root, "objects"), ".upload-*")
-	if err != nil {
-		return Entry{}, err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	hash := sha256.New()
-	size, copyErr := io.Copy(io.MultiWriter(tmp, hash), in)
-	closeErr := tmp.Close()
-	if copyErr != nil {
-		return Entry{}, copyErr
-	}
-	if closeErr != nil {
-		return Entry{}, closeErr
-	}
-	digest := hex.EncodeToString(hash.Sum(nil))
-	object := s.objectPath(digest)
-	if _, err := os.Stat(object); errors.Is(err, os.ErrNotExist) {
-		if err := os.Rename(tmpName, object); err != nil {
-			return Entry{}, err
+	var entry Entry
+	err := s.withLock(true, func() error {
+		if err := s.initLocked(); err != nil {
+			return err
 		}
-	}
-	idx, err := s.load()
+		in, err := os.Open(source)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		tmp, err := os.CreateTemp(filepath.Join(s.root, "objects"), ".upload-*")
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName)
+		hash := sha256.New()
+		size, copyErr := io.Copy(io.MultiWriter(tmp, hash), in)
+		closeErr := tmp.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		digest := hex.EncodeToString(hash.Sum(nil))
+		object := s.objectPath(digest)
+		if _, err := os.Stat(object); errors.Is(err, os.ErrNotExist) {
+			if err := os.Rename(tmpName, object); err != nil {
+				return err
+			}
+		}
+		idx, err := s.load()
+		if err != nil {
+			return err
+		}
+		entry = Entry{Name: name, Digest: digest, Size: size, CreatedAt: time.Now().UTC()}
+		idx.Entries[name] = entry
+		return s.save(idx)
+	})
 	if err != nil {
-		return Entry{}, err
-	}
-	entry := Entry{Name: name, Digest: digest, Size: size, CreatedAt: time.Now().UTC()}
-	idx.Entries[name] = entry
-	if err := s.save(idx); err != nil {
 		return Entry{}, err
 	}
 	return entry, nil
@@ -99,39 +134,48 @@ func (s *Store) Get(name, output string) error {
 	if output == "" {
 		return errors.New("output is required")
 	}
-	idx, err := s.load()
-	if err != nil {
-		return err
-	}
-	entry, ok := idx.Entries[name]
-	if !ok {
-		return fmt.Errorf("artifact %q not found", name)
-	}
-	in, err := os.Open(s.objectPath(entry.Digest))
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(output)
-	if err != nil {
-		return err
-	}
-	_, copyErr := io.Copy(out, in)
-	closeErr := out.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	return closeErr
+	return s.withLock(false, func() error {
+		idx, err := s.load()
+		if err != nil {
+			return err
+		}
+		entry, ok := idx.Entries[name]
+		if !ok {
+			return fmt.Errorf("artifact %q not found", name)
+		}
+		in, err := os.Open(s.objectPath(entry.Digest))
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.Create(output)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(out, in)
+		closeErr := out.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
 }
 
 func (s *Store) List() ([]Entry, error) {
-	idx, err := s.load()
+	var entries []Entry
+	err := s.withLock(false, func() error {
+		idx, err := s.load()
+		if err != nil {
+			return err
+		}
+		entries = make([]Entry, 0, len(idx.Entries))
+		for _, entry := range idx.Entries {
+			entries = append(entries, entry)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	entries := make([]Entry, 0, len(idx.Entries))
-	for _, entry := range idx.Entries {
-		entries = append(entries, entry)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return entries, nil
@@ -143,21 +187,30 @@ func (s *Store) Verify() (int, error) {
 		return 0, err
 	}
 	for _, entry := range entries {
-		file, err := os.Open(s.objectPath(entry.Digest))
-		if err != nil {
+		if err := s.verifyObject(entry); err != nil {
 			return 0, fmt.Errorf("verify %q: %w", entry.Name, err)
-		}
-		hash := sha256.New()
-		size, copyErr := io.Copy(hash, file)
-		closeErr := file.Close()
-		if copyErr != nil || closeErr != nil {
-			return 0, fmt.Errorf("verify %q: read failed", entry.Name)
-		}
-		if size != entry.Size || hex.EncodeToString(hash.Sum(nil)) != entry.Digest {
-			return 0, fmt.Errorf("verify %q: content mismatch", entry.Name)
 		}
 	}
 	return len(entries), nil
+}
+
+// verifyObject checks that the content object for entry exists and that its
+// actual size and SHA-256 match the recorded metadata.
+func (s *Store) verifyObject(entry Entry) error {
+	file, err := os.Open(s.objectPath(entry.Digest))
+	if err != nil {
+		return err
+	}
+	hash := sha256.New()
+	size, copyErr := io.Copy(hash, file)
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil {
+		return errors.New("read failed")
+	}
+	if size != entry.Size || hex.EncodeToString(hash.Sum(nil)) != entry.Digest {
+		return errors.New("content mismatch")
+	}
+	return nil
 }
 
 func (s *Store) load() (index, error) {
@@ -198,6 +251,7 @@ func (s *Store) save(idx index) error {
 }
 
 func (s *Store) indexPath() string               { return filepath.Join(s.root, "index.json") }
+func (s *Store) lockPath() string                { return filepath.Join(s.root, ".lock") }
 func (s *Store) objectPath(digest string) string { return filepath.Join(s.root, "objects", digest) }
 
 func validateName(name string) error {
