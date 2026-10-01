@@ -127,40 +127,6 @@ func (s *Store) Put(name, source string) (Entry, error) {
 	return entry, nil
 }
 
-func (s *Store) Get(name, output string) error {
-	if err := validateName(name); err != nil {
-		return err
-	}
-	if output == "" {
-		return errors.New("output is required")
-	}
-	return s.withLock(false, func() error {
-		idx, err := s.load()
-		if err != nil {
-			return err
-		}
-		entry, ok := idx.Entries[name]
-		if !ok {
-			return fmt.Errorf("artifact %q not found", name)
-		}
-		in, err := os.Open(s.objectPath(entry.Digest))
-		if err != nil {
-			return err
-		}
-		defer in.Close()
-		out, err := os.Create(output)
-		if err != nil {
-			return err
-		}
-		_, copyErr := io.Copy(out, in)
-		closeErr := out.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		return closeErr
-	})
-}
-
 func (s *Store) List() ([]Entry, error) {
 	var entries []Entry
 	err := s.withLock(false, func() error {

@@ -19,6 +19,10 @@ artifact-vault get --root ./vault --name releases/app.bin --output ./restored.bi
 artifact-vault verify --root ./vault
 ```
 
+`get` only delivers a file when the recorded name exists, the index and record are intact, and the stored object's actual size and SHA-256 match the record. The object is streamed and hashed into a temporary file beside the output; the output is replaced only after the complete, verified bytes are flushed, so a failed download leaves an existing output byte-for-byte unchanged and a missing output absent. Empty objects download normally, and large objects are streamed without buffering in memory.
+
+The output must be safe: its parent directory must exist (it is never created), it must not be inside the repository — including a not-yet-created path or a path reached through a symlinked parent — and an existing output must be a regular file outside the repository that is not a hard link to any index, snapshot, lock, or content object. Symlinks, directories, and other non-regular files are refused. Errors distinguish a missing name, a corrupt record, a corrupt object, and an unsafe or unwritable output, and name the relevant artifact or output path. A download takes the shared repository lock, so it always observes one complete pre- or post-operation version and can never be interrupted mid-collection.
+
 ## Snapshots
 
 Snapshots record the complete name mapping (name, digest, size, creation time of every entry) so the repository can be rolled back before overwriting artifacts. They reference the existing content objects; no artifact bytes are copied.
