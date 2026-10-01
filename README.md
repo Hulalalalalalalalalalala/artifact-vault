@@ -31,7 +31,26 @@ artifact-vault snapshot restore --root ./vault --name before-release
 
 `snapshot list` prints one `name<TAB>entry-count` line per snapshot, sorted by name. `snapshot restore` validates the record and re-checks every referenced object's size and SHA-256 before atomically replacing the current mapping; any failure leaves the current mapping and all snapshots unchanged. Restore works even when the current `index.json` is corrupted, as long as the snapshot and its objects are intact.
 
-Objects are stored beneath `objects/` by SHA-256 digest. `index.json` maps logical names to immutable object metadata, and `snapshots/` holds one JSON record per snapshot. Writes use temporary files followed by rename so interrupted writes do not expose partial objects, indexes, or snapshots. All mutating operations (`init`, `put`, `snapshot create`, `snapshot restore`, `gc`) are serialized across processes with an `flock` on `<root>/.lock`, which is released automatically if a process dies mid-operation.
+## Moving snapshots to another machine
+
+A snapshot package carries one complete snapshot, together with the content objects it needs, so it can be copied to and restored from a different repository.
+
+```bash
+artifact-vault snapshot export --root ./vault --name before-release --output ./before-release.vaultpkg
+artifact-vault snapshot export --root ./vault --name after-release --base before-release --output ./after-release.vaultpkg
+artifact-vault snapshot import --root ./other-vault --file ./before-release.vaultpkg
+artifact-vault snapshot restore --root ./other-vault --name before-release
+```
+
+The destination repository must already be initialized. `snapshot export` writes a portable package (`--output`, atomically) containing the target snapshot's full entry metadata; a digest shared by several entries is carried once. Export re-verifies the size and SHA-256 of every object the snapshot references and never leaves a partial output file behind on failure.
+
+With `--base <snapshot>` the package is incremental: it still records the target snapshot's complete mapping but only carries objects the base snapshot does not reference. Importing such a package requires the destination to already contain a snapshot with the base name and byte-identical entry metadata, with every omitted object present and intact; a same-named snapshot with different metadata, or objects that merely happen to share digests, is not a substitute for the base. A package without a base is self-contained and can be imported into an empty repository.
+
+Import only adds the package's snapshot and any missing objects; it never changes the current name mapping or any existing snapshot or object. Healthy objects already present in the destination (including in an empty target initialized first) are reused; re-importing a package whose snapshot is already present with identical metadata succeeds without adding another copy, while a same-named snapshot with different metadata is refused. Afterwards `snapshot restore` applies the imported mapping, and imported content is protected from `gc` exactly like any snapshot-referenced object. On any failure — unknown package version, illegal names or digests, negative sizes, duplicate entries, missing or mismatching content, or a damaged destination object — the current mapping, existing snapshots, and existing objects are left untouched; an interrupted import leaves at most unreferenced complete objects that the next `gc` clears and a retry completes.
+
+Export prints `exported snapshot <name> with <entries> entries, <objects> objects`; import prints `imported snapshot <name> with <entries> entries, <new-objects> new objects`.
+
+Objects are stored beneath `objects/` by SHA-256 digest. `index.json` maps logical names to immutable object metadata, and `snapshots/` holds one JSON record per snapshot. Writes use temporary files followed by rename so interrupted writes do not expose partial objects, indexes, or snapshots. All mutating operations (`init`, `put`, `snapshot create`, `snapshot restore`, `snapshot import`, `gc`) are serialized across processes with an `flock` on `<root>/.lock`, which is released automatically if a process dies mid-operation. `snapshot export` also takes the exclusive lock so the verified snapshot and its objects cannot change or be collected mid-export.
 
 ## Garbage collection
 

@@ -153,10 +153,11 @@ func (s *Store) saveSnapshot(path string, snap Snapshot) error {
 		return err
 	}
 	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := s.ensureSnapshotParent(path); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".snapshot-*")
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".snapshot-*")
 	if err != nil {
 		return err
 	}
@@ -170,6 +171,63 @@ func (s *Store) saveSnapshot(path string, snap Snapshot) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+// ensureSnapshotParent creates the parent directories of a snapshot record one
+// component at a time, refusing to follow symbolic links. Without this a nested
+// snapshot name such as "evil/x" could be redirected through a pre-created
+// snapshots/evil symlink to write outside the repository.
+func (s *Store) ensureSnapshotParent(path string) error {
+	base := s.snapshotsDir()
+	rel, err := filepath.Rel(base, filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errors.New("snapshot path escapes the snapshots directory")
+	}
+	// The base directory itself must exist and be a real directory, even for a
+	// top-level snapshot (a freshly initialized repository has no snapshots/).
+	cur := base
+	if err := ensureRealDir(cur); err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		next := filepath.Join(cur, component)
+		if err := ensureRealDir(next); err != nil {
+			return err
+		}
+		cur = next
+	}
+	return nil
+}
+
+// ensureRealDir makes sure path is a real directory, creating it if absent,
+// and refuses an existing symlink or non-directory.
+func ensureRealDir(path string) error {
+	info, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		info, err = os.Lstat(path)
+		if err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("repository path %q is a symbolic link", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("repository path %q is not a directory", path)
+	}
+	return nil
 }
 
 func (s *Store) snapshotsDir() string { return filepath.Join(s.root, "snapshots") }
