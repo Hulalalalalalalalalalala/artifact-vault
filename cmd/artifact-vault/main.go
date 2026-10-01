@@ -17,7 +17,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: artifact-vault <init|put|get|list|verify|snapshot>")
+		return fmt.Errorf("usage: artifact-vault <init|put|get|list|verify|snapshot|gc>")
 	}
 	command := args[0]
 	if command == "snapshot" {
@@ -28,6 +28,7 @@ func run(args []string) error {
 	name := flags.String("name", "", "logical artifact name")
 	file := flags.String("file", "", "input file")
 	output := flags.String("output", "", "output file")
+	dryRun := flags.Bool("dry-run", false, "preview garbage collection without deleting anything")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -58,6 +59,22 @@ func run(args []string) error {
 			fmt.Printf("verified %d artifacts\n", count)
 		}
 		return err
+	case "gc":
+		report, err := store.GC(*dryRun)
+		if err != nil {
+			return err
+		}
+		if *dryRun {
+			var bytes int64
+			for _, candidate := range report.Candidates {
+				fmt.Printf("%s\t%d\n", candidate.Digest, candidate.Size)
+				bytes += candidate.Size
+			}
+			fmt.Printf("total %d objects, %d bytes\n", len(report.Candidates), bytes)
+			return nil
+		}
+		fmt.Printf("deleted %d objects, %d bytes\n", report.Deleted, report.Bytes)
+		return nil
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
