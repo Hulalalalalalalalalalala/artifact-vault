@@ -43,6 +43,27 @@ func (s *Store) withLock(exclusive bool, fn func() error) error {
 			return err
 		}
 	}
+	return s.lockAndRun(exclusive, fn)
+}
+
+// withLockExisting serializes access like withLock but never creates the root
+// directory. Operations that must refuse an uninitialized repository (such as
+// gc) use this so a missing root or index is reported rather than auto-created.
+func (s *Store) withLockExisting(exclusive bool, fn func() error) error {
+	if strings.TrimSpace(s.root) == "" {
+		return errors.New("root is required")
+	}
+	info, err := os.Stat(s.root)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("root %q is not a directory", s.root)
+	}
+	return s.lockAndRun(exclusive, fn)
+}
+
+func (s *Store) lockAndRun(exclusive bool, fn func() error) error {
 	lock, err := os.OpenFile(s.lockPath(), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err

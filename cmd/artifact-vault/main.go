@@ -17,7 +17,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: artifact-vault <init|put|get|list|verify|snapshot>")
+		return fmt.Errorf("usage: artifact-vault <init|put|get|list|verify|gc|snapshot>")
 	}
 	command := args[0]
 	if command == "snapshot" {
@@ -28,6 +28,7 @@ func run(args []string) error {
 	name := flags.String("name", "", "logical artifact name")
 	file := flags.String("file", "", "input file")
 	output := flags.String("output", "", "output file")
+	dryRun := flags.Bool("dry-run", false, "list unreferenced objects without deleting")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -58,6 +59,20 @@ func run(args []string) error {
 			fmt.Printf("verified %d artifacts\n", count)
 		}
 		return err
+	case "gc":
+		result, err := store.GC(*dryRun)
+		if err != nil {
+			return err
+		}
+		if *dryRun {
+			for _, obj := range result.Candidates {
+				fmt.Printf("%s\t%d\n", obj.Digest, obj.Size)
+			}
+			fmt.Printf("%d objects, %d bytes\n", len(result.Candidates), result.Bytes)
+		} else {
+			fmt.Printf("deleted %d objects, %d bytes\n", result.Deleted, result.Bytes)
+		}
+		return nil
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
