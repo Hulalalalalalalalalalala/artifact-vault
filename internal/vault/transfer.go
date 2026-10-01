@@ -42,6 +42,12 @@ type ImportResult struct {
 // package is assembled in memory and written to a temporary file beside the
 // destination before an atomic rename: a failed export never creates or
 // alters the output file.
+//
+// The destination is protected before any work and re-checked at commit time:
+// it must be outside the repository (including through a symlinked parent or
+// root), its parent must exist, an existing output must be a regular file, and
+// it must not be a hard link to any repository file. Export never creates an
+// uninitialized repository.
 func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) {
 	if err := validateName(name); err != nil {
 		return ExportResult{}, err
@@ -54,9 +60,22 @@ func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) 
 	if output == "" {
 		return ExportResult{}, errors.New("output is required")
 	}
+	// Export never creates a repository: a missing root or index is an error.
+	if err := s.checkRepositoryReady(); err != nil {
+		return ExportResult{}, err
+	}
 	var result ExportResult
 	err := s.withLock(true, func() error {
-		if err := s.initLocked(); err != nil {
+		// Re-check under the lock: the repository must still be initialized.
+		if _, err := os.Stat(s.indexPath()); errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("repository %q is not initialized; run init first", s.root)
+		} else if err != nil {
+			return err
+		}
+		// Validate the destination before assembling anything, so an unsafe
+		// output is reported as an output error rather than discovered mid-write.
+		absOut, mode, err := s.checkExportOutput(output)
+		if err != nil {
 			return err
 		}
 		target, err := s.loadSnapshotRecord(name)
@@ -110,7 +129,7 @@ func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) 
 		if err != nil {
 			return err
 		}
-		if err := writeFileAtomic(output, data, ".package-*"); err != nil {
+		if err := s.writePackageAtomic(absOut, mode, output, data); err != nil {
 			return err
 		}
 		result = ExportResult{Name: name, Entries: len(target.Entries), Objects: len(pkg.Objects)}
@@ -396,32 +415,6 @@ func rejectLinkedDirs(root string) error {
 		}
 	}
 	return nil
-}
-
-// writeFileAtomic writes data to a temporary file in the destination's
-// directory and renames it over dest only after a complete flush. An existing
-// destination is left untouched on any earlier failure.
-func writeFileAtomic(dest string, data []byte, pattern string) error {
-	dir := filepath.Dir(dest)
-	if info, err := os.Lstat(dir); err != nil {
-		return err
-	} else if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("output directory %q is a symbolic link", dir)
-	}
-	tmp, err := os.CreateTemp(dir, pattern)
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, dest)
 }
 
 // snapshotsEqual reports whether two snapshot records carry the same snapshot
