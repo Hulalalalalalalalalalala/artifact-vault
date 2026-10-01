@@ -17,9 +17,12 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: artifact-vault <init|put|get|list|verify>")
+		return fmt.Errorf("usage: artifact-vault <init|put|get|list|verify|snapshot>")
 	}
 	command := args[0]
+	if command == "snapshot" {
+		return runSnapshot(args[1:])
+	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	root := flags.String("root", "./vault", "vault directory")
 	name := flags.String("name", "", "logical artifact name")
@@ -57,5 +60,45 @@ func run(args []string) error {
 		return err
 	default:
 		return fmt.Errorf("unknown command %q", command)
+	}
+}
+
+func runSnapshot(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: artifact-vault snapshot <create|list|restore> --root <directory> [--name <snapshot>]")
+	}
+	action := args[0]
+	flags := flag.NewFlagSet("snapshot "+action, flag.ContinueOnError)
+	root := flags.String("root", "./vault", "vault directory")
+	name := flags.String("name", "", "snapshot name")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	store := vault.New(*root)
+	switch action {
+	case "create":
+		snap, err := store.CreateSnapshot(*name)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("snapshot %s created with %d entries\n", snap.Name, len(snap.Entries))
+		return nil
+	case "list":
+		infos, err := store.ListSnapshots()
+		if err != nil {
+			return err
+		}
+		for _, info := range infos {
+			fmt.Printf("%s\t%d\n", info.Name, info.Entries)
+		}
+		return nil
+	case "restore":
+		if err := store.RestoreSnapshot(*name); err != nil {
+			return err
+		}
+		fmt.Printf("snapshot %s restored\n", *name)
+		return nil
+	default:
+		return fmt.Errorf("unknown snapshot subcommand %q", action)
 	}
 }
