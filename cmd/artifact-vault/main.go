@@ -82,12 +82,15 @@ func run(args []string) error {
 
 func runSnapshot(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: artifact-vault snapshot <create|list|restore> --root <dir> [--name <snapshot>]")
+		return fmt.Errorf("usage: artifact-vault snapshot <create|list|restore|export|import> --root <dir> [--name <snapshot>] [--output <file>] [--base <snapshot>] [--file <package>]")
 	}
 	sub := args[0]
 	flags := flag.NewFlagSet("snapshot "+sub, flag.ContinueOnError)
 	root := flags.String("root", "./vault", "vault directory")
 	name := flags.String("name", "", "snapshot name")
+	output := flags.String("output", "", "output package file")
+	base := flags.String("base", "", "base snapshot name for incremental export")
+	file := flags.String("file", "", "package file to import")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -113,6 +116,20 @@ func runSnapshot(args []string) error {
 			return err
 		}
 		fmt.Printf("restored snapshot %s\n", *name)
+		return nil
+	case "export":
+		result, err := store.ExportSnapshot(*name, *output, *base)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("exported snapshot %s: %d entries, %d objects\n", result.Name, result.Entries, result.Objects)
+		return nil
+	case "import":
+		result, err := store.ImportSnapshot(*file)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("imported snapshot %s: %d entries, %d objects added\n", result.Name, result.Entries, result.Added)
 		return nil
 	default:
 		return fmt.Errorf("unknown snapshot command %q", sub)
