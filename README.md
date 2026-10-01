@@ -19,6 +19,23 @@ artifact-vault get --root ./vault --name releases/app.bin --output ./restored.bi
 artifact-vault verify --root ./vault
 ```
 
+## Safe downloads
+
+`get` only delivers a file once the complete name record **and** the complete object content have been verified. Before anything is written it checks the current index and the selected entry: the index must parse and carry a name mapping, the entry must be filed under its own name with a 64-character lowercase-hex SHA-256 digest and a non-negative size. The object must exist, be a regular file (never a symbolic link), and its actual size and SHA-256 must match the record. Empty objects download as empty files. Failures fall into four distinct classes, each naming the artifact or output path: name not found, a corrupted record, a corrupted/missing object, and an unusable output target.
+
+The verified bytes are streamed to a temporary file in the output directory (memory use stays constant regardless of object size) and published with a single atomic rename. Consequently an existing output file keeps its exact bytes after any failure — it is never truncated first — and when the output does not exist no half-written file ever occupies its name; a crash leaves at most an unpublished `.download-*` temp file, and the next `get` completes without manual cleanup. The delivered file keeps the previous file's permission bits (new files are created `0644`).
+
+Output safety rules:
+
+- the parent directory must already exist (no directories are created);
+- an existing output that is a directory, symbolic link, or other non-regular file is refused;
+- no path inside the repository is accepted, including paths that do not exist yet and paths that enter the repository through a symbolic link in a parent directory;
+- an existing destination outside the repository is refused when it is a hard link to `index.json`, `.lock`, a snapshot record, or a content object, so replacing it cannot modify a repository file;
+- ordinary paths outside the repository continue to be created or overwritten.
+
+A download holds the shared repository lock and never modifies the index, snapshots, or content objects, so a concurrent `put`, snapshot restore, or garbage collection can only make it observe the complete before- or after-version of one record and object — never a mix, and never an object collected mid-download.
+
+
 ## Snapshots
 
 Snapshots record the complete name mapping (name, digest, size, creation time of every entry) so the repository can be rolled back before overwriting artifacts. They reference the existing content objects; no artifact bytes are copied.

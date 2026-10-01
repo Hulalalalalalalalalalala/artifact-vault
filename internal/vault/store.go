@@ -127,6 +127,34 @@ func (s *Store) Put(name, source string) (Entry, error) {
 	return entry, nil
 }
 
+// Sentinel errors classifying download failures. Callers can distinguish a
+// missing name from a damaged record, a damaged object, and an unusable output
+// target with errors.Is while the wrapped message still names the name or the
+// output path.
+var (
+	ErrNameNotFound      = errors.New("name not found")
+	ErrRecordDamaged     = errors.New("record is corrupted")
+	ErrObjectDamaged     = errors.New("content object is corrupted")
+	ErrOutputUnavailable = errors.New("output is unavailable")
+)
+
+// Get downloads the artifact recorded under name to output.
+//
+// The file is only delivered once the full name record and the full object
+// content have been validated: the index must parse and carry a name mapping,
+// the selected entry must be filed under its own name with a 64 lowercase-hex
+// digest and a non-negative size, and the object must be a regular file whose
+// actual size and SHA-256 match the record. The object is streamed to a
+// temporary file beside the destination in constant-size buffers, so memory
+// use does not grow with the object, and an os.Rename is the single commit
+// point: an existing output keeps its exact bytes on any failure, and a
+// missing output is never replaced by a half-written file. A crash can leave
+// only an unpublished temp file, which never blocks a retry.
+//
+// Get runs entirely under the shared repository lock and never writes inside
+// the repository, so concurrent uploads, snapshot restores, and garbage
+// collections serialize against it and it observes one complete record and
+// object version at a time.
 func (s *Store) Get(name, output string) error {
 	if err := validateName(name); err != nil {
 		return err
@@ -134,30 +162,115 @@ func (s *Store) Get(name, output string) error {
 	if output == "" {
 		return errors.New("output is required")
 	}
+	if strings.TrimSpace(s.root) == "" {
+		return errors.New("root is required")
+	}
 	return s.withLock(false, func() error {
-		idx, err := s.load()
+		// Resolve and authorize the destination before touching any content.
+		prep, err := s.prepareOutput(output)
 		if err != nil {
 			return err
+		}
+
+		idx, err := s.loadStrict()
+		if err != nil {
+			return fmt.Errorf("cannot download %q: %w: %v", name, ErrRecordDamaged, err)
 		}
 		entry, ok := idx.Entries[name]
 		if !ok {
-			return fmt.Errorf("artifact %q not found", name)
+			return fmt.Errorf("cannot download %q: %w", name, ErrNameNotFound)
 		}
-		in, err := os.Open(s.objectPath(entry.Digest))
+		if err := validateEntryRecord(name, entry); err != nil {
+			return fmt.Errorf("cannot download %q: %w: %v", name, ErrRecordDamaged, err)
+		}
+
+		// Stream the object to a temp file beside the destination while
+		// measuring and hashing it in fixed-size buffers. Until the rename
+		// below, nothing occupies the requested output path.
+		object := s.objectPath(entry.Digest)
+		// Lstat (not Stat): a symlink must be rejected even when it points at
+		// an intact file elsewhere.
+		objInfo, err := os.Lstat(object)
 		if err != nil {
-			return err
+			return fmt.Errorf("cannot download %q: %w: object %s: %v", name, ErrObjectDamaged, entry.Digest, err)
 		}
-		defer in.Close()
-		out, err := os.Create(output)
+		if objInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("cannot download %q: %w: object %s is a symbolic link", name, ErrObjectDamaged, entry.Digest)
+		}
+		if !objInfo.Mode().IsRegular() {
+			return fmt.Errorf("cannot download %q: %w: object %s is not a regular file", name, ErrObjectDamaged, entry.Digest)
+		}
+		if objInfo.Size() != entry.Size {
+			return fmt.Errorf("cannot download %q: %w: object %s is %d bytes, record says %d",
+				name, ErrObjectDamaged, entry.Digest, objInfo.Size(), entry.Size)
+		}
+		// O_NOFOLLOW closes the Lstat-to-open race: the descriptor never binds
+		// to a symbolic link swapped in after the check.
+		in, err := os.OpenFile(object, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
-			return err
+			if errors.Is(err, syscall.ELOOP) {
+				return fmt.Errorf("cannot download %q: %w: object %s is a symbolic link", name, ErrObjectDamaged, entry.Digest)
+			}
+			return fmt.Errorf("cannot download %q: %w: object %s: %v", name, ErrObjectDamaged, entry.Digest, err)
 		}
-		_, copyErr := io.Copy(out, in)
-		closeErr := out.Close()
+
+		tmp, err := os.CreateTemp(prep.TempDir, prep.Pattern)
+		if err != nil {
+			in.Close()
+			return fmt.Errorf("cannot download %q to %s: %w: %v", name, output, ErrOutputUnavailable, err)
+		}
+		tmpName := tmp.Name()
+		// The temp file is an unpublished artifact: remove it on any failure so
+		// a retry starts clean without manual cleanup.
+		committed := false
+		defer func() {
+			if !committed {
+				os.Remove(tmpName)
+			}
+		}()
+
+		hasher := sha256.New()
+		written, copyErr := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(in, entry.Size+1))
+		closeInErr := in.Close()
 		if copyErr != nil {
-			return copyErr
+			tmp.Close()
+			return fmt.Errorf("cannot download %q: %w: object %s: %v", name, ErrObjectDamaged, entry.Digest, copyErr)
 		}
-		return closeErr
+		if closeInErr != nil {
+			tmp.Close()
+			return fmt.Errorf("cannot download %q: %w: object %s: %v", name, ErrObjectDamaged, entry.Digest, closeInErr)
+		}
+		if written != entry.Size {
+			tmp.Close()
+			return fmt.Errorf("cannot download %q: %w: object %s is %d bytes, record says %d",
+				name, ErrObjectDamaged, entry.Digest, written, entry.Size)
+		}
+		if actual := hex.EncodeToString(hasher.Sum(nil)); actual != entry.Digest {
+			tmp.Close()
+			return fmt.Errorf("cannot download %q: %w: object %s has checksum %s",
+				name, ErrObjectDamaged, entry.Digest, actual)
+		}
+		// Flush the complete payload to disk before publishing it.
+		if err := tmp.Sync(); err != nil {
+			tmp.Close()
+			return fmt.Errorf("cannot download %q to %s: %w: %v", name, output, ErrOutputUnavailable, err)
+		}
+		if err := tmp.Close(); err != nil {
+			return fmt.Errorf("cannot download %q to %s: %w: %v", name, output, ErrOutputUnavailable, err)
+		}
+		// Publish with the destination's previous permission bits (0644 for
+		// a new file). Chmod on the unpublished temp file cannot affect an
+		// existing hard-linked destination.
+		if err := os.Chmod(tmpName, prep.Mode); err != nil {
+			return fmt.Errorf("cannot download %q to %s: %w: %v", name, output, ErrOutputUnavailable, err)
+		}
+		// Single commit point: the destination is atomically either the old
+		// file or the complete new file, never a partial one.
+		if err := os.Rename(tmpName, output); err != nil {
+			return fmt.Errorf("cannot download %q to %s: %w: %v", name, output, ErrOutputUnavailable, err)
+		}
+		committed = true
+		return nil
 	})
 }
 
