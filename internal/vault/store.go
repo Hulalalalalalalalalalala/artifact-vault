@@ -35,16 +35,35 @@ func New(root string) *Store { return &Store{root: root} }
 // lock is an flock on <root>/.lock, so it is released automatically if a
 // process dies mid-operation and nothing can wait forever on a stale lock.
 func (s *Store) withLock(exclusive bool, fn func() error) error {
+	return s.withLockOpts(exclusive, true, fn)
+}
+
+// withLockOpts is withLock with control over root creation. Read-only-style
+// operations that must never materialize a missing repository (such as
+// export) pass createRoot=false.
+func (s *Store) withLockOpts(exclusive, createRoot bool, fn func() error) error {
 	if strings.TrimSpace(s.root) == "" {
 		return errors.New("root is required")
 	}
-	if exclusive {
+	if createRoot {
 		if err := os.MkdirAll(s.root, 0o755); err != nil {
 			return err
 		}
 	}
-	lock, err := os.OpenFile(s.lockPath(), os.O_CREATE|os.O_RDWR, 0o644)
+	// Read-only operations that must not materialize anything open the lock
+	// without O_CREATE: an initialized repository always has a lock file, so
+	// a missing one means the repository was never initialized.
+	var lock *os.File
+	var err error
+	if createRoot {
+		lock, err = os.OpenFile(s.lockPath(), os.O_CREATE|os.O_RDWR, 0o644)
+	} else {
+		lock, err = os.OpenFile(s.lockPath(), os.O_RDWR, 0o644)
+	}
 	if err != nil {
+		if !createRoot && errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("repository %q is not initialized; run init first", s.root)
+		}
 		return err
 	}
 	defer lock.Close()
