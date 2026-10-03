@@ -235,25 +235,41 @@ func (s *Store) List() ([]Entry, error) {
 
 // Verify checks every entry of the current name mapping against its content
 // object: the object must exist and its actual size and SHA-256 must match
-// the recorded metadata. The whole pass — reading the mapping and checking
-// every object it references — runs under one shared repository lock, so the
-// mapping and the objects it points at cannot be replaced or collected by
-// another process between the first read and the last check: an overwrite,
-// snapshot restore, import, or gc either completes before the pass starts
-// (and the pass observes the completed state) or waits until the pass ends.
-// The lock is shared, so concurrent lists, downloads, and other verifies
-// proceed alongside it. Verify never rewrites the mapping, snapshots, or
-// objects, and never repairs damaged content; on the first failure it
-// reports the artifact name and returns a zero count.
+// the recorded metadata. The mapping itself must be complete and unambiguous
+// first: the index must be one complete JSON object with an explicitly
+// present entries mapping (a true {"entries":{}} is a legitimate empty
+// repository; null, a missing or null entries field, an array, truncated
+// input, trailing content, or any duplicate key — including a name repeated
+// through Unicode escapes — is corruption), and every record must pass the
+// same validity checks downloads and gc apply (keyed by its recorded name, a
+// legal name, a 64-character lowercase-hex digest, a non-negative size). A
+// single malformed record fails the whole pass; bad records are never
+// skipped to report success over the rest. Mapping problems are reported
+// before any object is read, so index corruption is always distinguished
+// from object damage.
+//
+// The whole pass — reading the mapping and checking every object it
+// references — runs under one shared repository lock, so the mapping and the
+// objects it points at cannot be replaced or collected by another process
+// between the first read and the last check: an overwrite, snapshot restore,
+// import, or gc either completes before the pass starts (and the pass
+// observes the completed state) or waits until the pass ends. The lock is
+// shared, so concurrent lists, downloads, and other verifies proceed
+// alongside it. Verify never rewrites the mapping, snapshots, or objects,
+// and never repairs damaged content; on the first failure it reports the
+// cause and returns a zero count.
 func (s *Store) Verify() (int, error) {
 	count := 0
 	err := s.withLock(false, func() error {
-		idx, err := s.load()
+		idx, err := s.loadStrict()
 		if err != nil {
 			return err
 		}
 		entries := make([]Entry, 0, len(idx.Entries))
-		for _, entry := range idx.Entries {
+		for key, entry := range idx.Entries {
+			if err := validateEntryRecord(key, entry); err != nil {
+				return fmt.Errorf("current index is corrupt: %w", err)
+			}
 			entries = append(entries, entry)
 		}
 		// Sort by name so the first reported failure is deterministic.

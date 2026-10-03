@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -145,15 +146,19 @@ func (s *Store) collectReferences() (map[string]struct{}, error) {
 	return referenced, nil
 }
 
-// loadStrict reads the current index for GC. Unlike load it rejects a
-// missing or null entries mapping, since GC cannot distinguish "no entries"
-// from "references lost" in that case. It also rejects any duplicate JSON
-// key anywhere in the document — a repeated entries mapping, a repeated
-// artifact name, or a repeated field inside one record — because
-// encoding/json would silently keep only the last record and GC cannot tell
-// which references the overwritten records carried. Keys are compared after
-// JSON string decoding, so a name written directly and the same name written
-// with Unicode escapes still collide.
+// loadStrict reads the current index for GC and verify. Unlike load it
+// requires the document to be one complete JSON object with an explicitly
+// present entries mapping: a bare null, an array, a primitive, truncated
+// input, or trailing content after the object is corruption, and a missing
+// or null entries mapping cannot be distinguished from "references lost".
+// (A true {"entries":{}} remains a legitimate empty repository.) It also
+// rejects any duplicate JSON key anywhere in the document — a repeated
+// entries mapping, a repeated artifact name, or a repeated field inside one
+// record — because encoding/json would silently keep only the last record
+// and neither GC nor verify can tell which references the overwritten
+// records carried. Keys are compared after JSON string decoding, so a name
+// written directly and the same name written with Unicode escapes still
+// collide.
 func (s *Store) loadStrict() (index, error) {
 	data, err := os.ReadFile(s.indexPath())
 	if errors.Is(err, os.ErrNotExist) {
@@ -165,12 +170,19 @@ func (s *Store) loadStrict() (index, error) {
 	if err := rejectDuplicateKeys(data); err != nil {
 		return index{}, fmt.Errorf("current index is corrupt: %w", err)
 	}
+	// The document must be a JSON object: a bare null, array, or primitive is
+	// a corrupt index, never an empty mapping.
+	if trimmed := bytes.TrimSpace(data); len(trimmed) == 0 || trimmed[0] != '{' {
+		return index{}, errors.New("current index is corrupt: expected a JSON object with an entries mapping")
+	}
 	var idx index
+	// json.Unmarshal rejects truncated input and trailing content after the
+	// top-level value.
 	if err := json.Unmarshal(data, &idx); err != nil {
-		return index{}, err
+		return index{}, fmt.Errorf("current index is corrupt: %w", err)
 	}
 	if idx.Entries == nil {
-		return index{}, errors.New("missing entries mapping")
+		return index{}, errors.New("current index is corrupt: missing entries mapping")
 	}
 	return idx, nil
 }
