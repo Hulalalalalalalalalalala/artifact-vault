@@ -99,9 +99,15 @@ func (s *Store) ListSnapshots() ([]SnapshotInfo, error) {
 
 // RestoreSnapshot replaces the current name mapping with the snapshot's
 // recorded mapping in a single atomic index write. The current index is never
-// read, so restore works even when it is corrupted. Every referenced object
-// is checked for existence, size, and SHA-256 before the mapping is swapped;
-// any failure leaves the current mapping and all snapshots untouched.
+// read, so restore works even when it is corrupted. The stored snapshot record
+// is accepted only when it is complete and well-formed — a JSON object whose
+// entries mapping is explicitly present (a missing field, a null value, or a
+// null or otherwise unparseable body is corruption, never an empty snapshot)
+// and whose recorded name equals the requested snapshot name in full,
+// including multi-level names such as "releases/stable". Every referenced
+// object is then checked for existence, size, and SHA-256 before the mapping
+// is swapped; any failure leaves the current mapping (even a corrupted one),
+// the snapshot record, and every content object untouched.
 func (s *Store) RestoreSnapshot(name string) error {
 	if err := validateName(name); err != nil {
 		return err
@@ -110,38 +116,12 @@ func (s *Store) RestoreSnapshot(name string) error {
 		if err := s.initLocked(); err != nil {
 			return err
 		}
-		data, err := os.ReadFile(s.snapshotPath(name))
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("snapshot %q not found", name)
-		}
+		snap, err := s.loadSnapshotRecord(name)
 		if err != nil {
 			return err
 		}
-		var snap Snapshot
-		if err := json.Unmarshal(data, &snap); err != nil {
-			return fmt.Errorf("snapshot %q is corrupted: %w", name, err)
-		}
-		if snap.Entries == nil {
-			snap.Entries = map[string]Entry{}
-		}
-		for key, entry := range snap.Entries {
-			if entry.Name != key {
-				return fmt.Errorf("snapshot %q is corrupted: entry %q is filed under %q", name, entry.Name, key)
-			}
-			if err := validateName(entry.Name); err != nil {
-				return fmt.Errorf("snapshot %q is corrupted: invalid entry name %q", name, entry.Name)
-			}
-			if !isDigest(entry.Digest) {
-				return fmt.Errorf("snapshot %q is corrupted: entry %q has digest %q, want 64 lowercase hex characters", name, entry.Name, entry.Digest)
-			}
-			if entry.Size < 0 {
-				return fmt.Errorf("snapshot %q is corrupted: entry %q has negative size %d", name, entry.Name, entry.Size)
-			}
-		}
-		for _, entry := range snap.Entries {
-			if err := s.verifyObject(entry); err != nil {
-				return fmt.Errorf("cannot restore snapshot %q: object for %q: %w", name, entry.Name, err)
-			}
+		if err := s.verifyReferencedObjects(name, snap.Entries); err != nil {
+			return fmt.Errorf("cannot restore snapshot %q: %w", name, err)
 		}
 		return s.save(index{Entries: snap.Entries})
 	})

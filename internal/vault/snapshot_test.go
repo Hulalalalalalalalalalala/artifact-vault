@@ -247,11 +247,16 @@ func TestCreateWithCorruptIndexFails(t *testing.T) {
 func TestRestoreValidatesRecords(t *testing.T) {
 	goodDigest := hex.EncodeToString(sha256.New().Sum(nil))
 	cases := map[string]string{
-		"bad json":       `{broken`,
-		"bad entry name": `{"name":"s","entries":{"../evil":{"name":"../evil","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
-		"bad digest":     `{"name":"s","entries":{"a":{"name":"a","digest":"XYZ","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
-		"negative size":  `{"name":"s","entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":-1,"createdAt":"2026-01-01T00:00:00Z"}}}`,
-		"key mismatch":   `{"name":"s","entries":{"a":{"name":"b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+		"bad json":        `{broken`,
+		"null body":       `null`,
+		"empty object":    `{}`,
+		"missing entries": `{"name":"s"}`,
+		"null entries":    `{"name":"s","entries":null}`,
+		"wrong name":      `{"name":"other","entries":{}}`,
+		"bad entry name":  `{"name":"s","entries":{"../evil":{"name":"../evil","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+		"bad digest":      `{"name":"s","entries":{"a":{"name":"a","digest":"XYZ","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+		"negative size":   `{"name":"s","entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":-1,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+		"key mismatch":    `{"name":"s","entries":{"a":{"name":"b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
 	}
 	for label, record := range cases {
 		t.Run(label, func(t *testing.T) {
@@ -266,8 +271,14 @@ func TestRestoreValidatesRecords(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(root, "snapshots", "s.json"), []byte(record), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.RestoreSnapshot("s"); err == nil {
+			err := store.RestoreSnapshot("s")
+			if err == nil {
 				t.Fatal("expected restore to reject corrupted record")
+			}
+			// The failure names the snapshot the user selected and never reads
+			// as a success.
+			if !strings.Contains(err.Error(), `"s"`) {
+				t.Fatalf("error does not name snapshot %q: %v", "s", err)
 			}
 			// The current mapping is unchanged.
 			entries, err := store.List()
@@ -278,6 +289,135 @@ func TestRestoreValidatesRecords(t *testing.T) {
 				t.Fatalf("entries=%+v", entries)
 			}
 		})
+	}
+}
+
+func TestRestoreRequiresFullMultilevelName(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	if _, err := store.Put("keep.txt", writeFile(t, "keep me")); err != nil {
+		t.Fatal(err)
+	}
+	snapDir := filepath.Join(root, "snapshots", "releases")
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	snapPath := filepath.Join(snapDir, "stable.json")
+
+	// A record remembering only the final component, or recording another name
+	// entirely, is not releases/stable.
+	for _, record := range []string{
+		`{"name":"stable","entries":{}}` + "\n",
+		`{"name":"releases/other","entries":{}}` + "\n",
+	} {
+		if err := os.WriteFile(snapPath, []byte(record), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := store.RestoreSnapshot("releases/stable")
+		if err == nil {
+			t.Fatalf("record %q should be rejected", record)
+		}
+		if !strings.Contains(err.Error(), "releases/stable") {
+			t.Fatalf("error must name the selected snapshot: %v", err)
+		}
+		if entries, err := store.List(); err != nil || len(entries) != 1 {
+			t.Fatalf("mapping changed after rejected restore: %+v err=%v", entries, err)
+		}
+	}
+
+	// The correctly named record with an explicit empty entries mapping is a
+	// legitimate empty snapshot and restores to an empty list.
+	if err := os.WriteFile(snapPath, []byte(`{"name":"releases/stable","entries":{}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RestoreSnapshot("releases/stable"); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := store.List(); err != nil || len(entries) != 0 {
+		t.Fatalf("entries=%+v err=%v", entries, err)
+	}
+}
+
+func TestRestoreFailureKeepsCorruptIndexCorrupt(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	if _, err := store.Put("a.txt", writeFile(t, "good")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSnapshot("stable"); err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(root, "index.json")
+	if err := os.WriteFile(indexPath, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapPath := filepath.Join(root, "snapshots", "stable.json")
+	healthy, err := os.ReadFile(snapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Damage the record: the entries mapping is missing, so the corrupt index
+	// must not be replaced by an empty mapping.
+	if err := os.WriteFile(snapPath, []byte(`{"name":"stable"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RestoreSnapshot("stable"); err == nil {
+		t.Fatal("expected restore to fail")
+	}
+	got, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "{not json" {
+		t.Fatalf("corrupt index was rewritten: %q", got)
+	}
+	// A complete, healthy snapshot still repairs the corrupt index.
+	if err := os.WriteFile(snapPath, healthy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RestoreSnapshot("stable"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.List()
+	if err != nil || len(entries) != 1 || entries[0].Name != "a.txt" {
+		t.Fatalf("entries=%+v err=%v", entries, err)
+	}
+}
+
+func TestRestorePreservesRecordedMetadata(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	entry, err := store.Put("releases/app.bin", writeFile(t, "payload bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSnapshot("releases/stable"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("releases/app.bin", writeFile(t, "changed payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RestoreSnapshot("releases/stable"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.List()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("entries=%+v err=%v", entries, err)
+	}
+	got := entries[0]
+	if got.Name != entry.Name || got.Digest != entry.Digest || got.Size != entry.Size || !got.CreatedAt.Equal(entry.CreatedAt) {
+		t.Fatalf("restored metadata mismatch:\n got %+v\nwant %+v", got, entry)
+	}
+	output := filepath.Join(t.TempDir(), "app.bin")
+	if err := store.Get("releases/app.bin", output); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "payload bytes" {
+		t.Fatalf("restored content=%q", data)
 	}
 }
 
