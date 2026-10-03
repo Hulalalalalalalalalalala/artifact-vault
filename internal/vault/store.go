@@ -233,17 +233,43 @@ func (s *Store) List() ([]Entry, error) {
 	return entries, nil
 }
 
+// Verify checks every entry of the current name mapping against its content
+// object: the object must exist and its actual size and SHA-256 must match
+// the recorded metadata. The whole pass — reading the mapping and checking
+// every object it references — runs under one shared repository lock, so the
+// mapping and the objects it points at cannot be replaced or collected by
+// another process between the first read and the last check: an overwrite,
+// snapshot restore, import, or gc either completes before the pass starts
+// (and the pass observes the completed state) or waits until the pass ends.
+// The lock is shared, so concurrent lists, downloads, and other verifies
+// proceed alongside it. Verify never rewrites the mapping, snapshots, or
+// objects, and never repairs damaged content; on the first failure it
+// reports the artifact name and returns a zero count.
 func (s *Store) Verify() (int, error) {
-	entries, err := s.List()
+	count := 0
+	err := s.withLock(false, func() error {
+		idx, err := s.load()
+		if err != nil {
+			return err
+		}
+		entries := make([]Entry, 0, len(idx.Entries))
+		for _, entry := range idx.Entries {
+			entries = append(entries, entry)
+		}
+		// Sort by name so the first reported failure is deterministic.
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+		for _, entry := range entries {
+			if err := s.verifyObject(entry); err != nil {
+				return fmt.Errorf("verify %q: %w", entry.Name, err)
+			}
+		}
+		count = len(entries)
+		return nil
+	})
 	if err != nil {
 		return 0, err
 	}
-	for _, entry := range entries {
-		if err := s.verifyObject(entry); err != nil {
-			return 0, fmt.Errorf("verify %q: %w", entry.Name, err)
-		}
-	}
-	return len(entries), nil
+	return count, nil
 }
 
 // verifyObject checks that the content object for entry exists and that its
