@@ -147,7 +147,13 @@ func (s *Store) collectReferences() (map[string]struct{}, error) {
 
 // loadStrict reads the current index for GC. Unlike load it rejects a
 // missing or null entries mapping, since GC cannot distinguish "no entries"
-// from "references lost" in that case.
+// from "references lost" in that case. It also rejects any duplicate JSON
+// key anywhere in the document — a repeated entries mapping, a repeated
+// artifact name, or a repeated field inside one record — because
+// encoding/json would silently keep only the last record and GC cannot tell
+// which references the overwritten records carried. Keys are compared after
+// JSON string decoding, so a name written directly and the same name written
+// with Unicode escapes still collide.
 func (s *Store) loadStrict() (index, error) {
 	data, err := os.ReadFile(s.indexPath())
 	if errors.Is(err, os.ErrNotExist) {
@@ -155,6 +161,9 @@ func (s *Store) loadStrict() (index, error) {
 	}
 	if err != nil {
 		return index{}, err
+	}
+	if err := rejectDuplicateKeys(data); err != nil {
+		return index{}, fmt.Errorf("current index is corrupt: %w", err)
 	}
 	var idx index
 	if err := json.Unmarshal(data, &idx); err != nil {

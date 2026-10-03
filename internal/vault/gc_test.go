@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -357,16 +358,21 @@ func TestGCRejectsCorruptReferences(t *testing.T) {
 		snapName string
 		snap     string
 	}{
-		"index bad json":      {index: `{broken`},
-		"index no entries":    {index: `{}`},
-		"index null entries":  {index: `{"entries":null}`},
-		"index key mismatch":  {index: `{"entries":{"a":{"name":"b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
-		"index bad name":      {index: `{"entries":{"../x":{"name":"../x","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
-		"index bad digest":    {index: `{"entries":{"a":{"name":"a","digest":"XYZ","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
-		"index negative size": {index: `{"entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":-1,"createdAt":"2026-01-01T00:00:00Z"}}}`},
-		"snap bad json":       {snapName: "s", snap: `{broken`},
-		"snap no entries":     {snapName: "s", snap: `{"name":"s"}`},
-		"snap name mismatch":  {snapName: "s", snap: `{"name":"other","entries":{}}`},
+		"index bad json":                   {index: `{broken`},
+		"index no entries":                 {index: `{}`},
+		"index null entries":               {index: `{"entries":null}`},
+		"index key mismatch":               {index: `{"entries":{"a":{"name":"b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
+		"index bad name":                   {index: `{"entries":{"../x":{"name":"../x","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
+		"index bad digest":                 {index: `{"entries":{"a":{"name":"a","digest":"XYZ","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
+		"index negative size":              {index: `{"entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":-1,"createdAt":"2026-01-01T00:00:00Z"}}}`},
+		"index duplicate entries key":      {index: `{"entries":{},"entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
+		"index duplicate artifact":         {index: `{"entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"},"a":{"name":"a","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
+		"index duplicate entry field":      {index: `{"entries":{"a":{"name":"a","digest":"` + goodDigest + `","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
+		"index duplicate escaped artifact": {index: `{"entries":{"a/b":{"name":"a/b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"},"a/b":{"name":"a/b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
+		"index duplicate unicode artifact": {index: `{"entries":{"a/b":{"name":"a/b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"},"a` + `\u002f` + `b":{"name":"a/b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`},
+		"snap bad json":                    {snapName: "s", snap: `{broken`},
+		"snap no entries":                  {snapName: "s", snap: `{"name":"s"}`},
+		"snap name mismatch":               {snapName: "s", snap: `{"name":"other","entries":{}}`},
 		"snap nested mismatch": {snapName: "deep/s",
 			snap: `{"name":"s","entries":{}}`},
 		"snap bad entry": {snapName: "s",
@@ -409,6 +415,81 @@ func TestGCRejectsCorruptReferences(t *testing.T) {
 			}
 			if !objectExists(root, entry.Digest) {
 				t.Fatal("failed GC deleted a referenced object")
+			}
+		})
+	}
+}
+
+// A duplicate JSON key anywhere in the current index makes the whole
+// document unusable as a name mapping: GC must report the index as corrupt,
+// name the duplicated key, and leave every object, the index, and all
+// snapshots byte-for-byte intact — even objects with no references at all.
+func TestGCRejectsDuplicateKeysInCurrentIndex(t *testing.T) {
+	goodDigest := digestOf("good")
+	cases := map[string]string{
+		"duplicate entries key":                `{"entries":{},"entries":{}}`,
+		"duplicate artifact":                   `{"entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"},"a":{"name":"a","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+		"duplicate artifact differing records": `{"entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"},"a":{"name":"a","digest":"` + digestOf("other") + `","size":1,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+		"duplicate entry field":                `{"entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":0,"size":1,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+		"unicode escaped duplicate":            `{"entries":{"a/b":{"name":"a/b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"},"a` + `\u002f` + `b":{"name":"a/b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+	}
+	for label, index := range cases {
+		t.Run(label, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "vault")
+			store := New(root)
+			entry, err := store.Put("keep.txt", writeFile(t, "keep me"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.CreateSnapshot("snap"); err != nil {
+				t.Fatal(err)
+			}
+			// An object with no references anywhere: it must survive too.
+			stray := digestOf("stray")
+			if err := os.WriteFile(filepath.Join(root, "objects", stray), []byte("stray"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			indexPath := filepath.Join(root, "index.json")
+			if err := os.WriteFile(indexPath, []byte(index), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			snapBefore, err := os.ReadFile(filepath.Join(root, "snapshots", "snap.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, dryRun := range []bool{true, false} {
+				report, err := store.GC(dryRun)
+				if err == nil {
+					t.Fatalf("dryRun=%v: expected error", dryRun)
+				}
+				if !strings.Contains(err.Error(), "current index") {
+					t.Fatalf("dryRun=%v: error does not name the current index: %v", dryRun, err)
+				}
+				if !strings.Contains(err.Error(), "duplicate key") {
+					t.Fatalf("dryRun=%v: error does not report a duplicate key: %v", dryRun, err)
+				}
+				if len(report.Candidates) != 0 || report.Deleted != 0 || report.Bytes != 0 {
+					t.Fatalf("dryRun=%v: report=%+v", dryRun, report)
+				}
+			}
+			for _, digest := range []string{entry.Digest, stray} {
+				if !objectExists(root, digest) {
+					t.Fatalf("object %s was deleted", digest)
+				}
+			}
+			indexAfter, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(indexAfter) != index {
+				t.Fatal("index.json was rewritten")
+			}
+			snapAfter, err := os.ReadFile(filepath.Join(root, "snapshots", "snap.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(snapAfter) != string(snapBefore) {
+				t.Fatal("snapshot was rewritten")
 			}
 		})
 	}
