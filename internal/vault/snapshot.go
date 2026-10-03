@@ -58,13 +58,28 @@ func (s *Store) CreateSnapshot(name string) (Snapshot, error) {
 	return snap, nil
 }
 
-// ListSnapshots returns every saved snapshot sorted by name. A repository
-// with no snapshots yields an empty list.
+// ListSnapshots returns every saved snapshot sorted by full name. A
+// repository whose snapshots directory does not exist yet yields an empty
+// list. Every record found is validated with the same strictness as restore
+// (loadSnapshotRecord): a single well-formed object recording its own full
+// name and carrying a present entries mapping of valid entry records. The
+// first corrupted or unreadable record fails the whole listing — no partial
+// list is returned — and a record that disappears between the directory walk
+// and the read is reported, never silently dropped. Only snapshot metadata is
+// read; content objects are not touched, and the listing never modifies the
+// current mapping, snapshot records, or objects.
 func (s *Store) ListSnapshots() ([]SnapshotInfo, error) {
 	infos := []SnapshotInfo{}
 	err := s.withLock(false, func() error {
 		dir := s.snapshotsDir()
-		err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		// Only a missing snapshots directory itself means "no snapshots yet".
+		// NotExist errors raised while walking or reading a record propagate.
+		if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -76,21 +91,13 @@ func (s *Store) ListSnapshots() ([]SnapshotInfo, error) {
 				return err
 			}
 			name := strings.TrimSuffix(filepath.ToSlash(rel), ".json")
-			data, err := os.ReadFile(path)
+			snap, err := s.loadSnapshotRecord(name)
 			if err != nil {
 				return err
-			}
-			var snap Snapshot
-			if err := json.Unmarshal(data, &snap); err != nil {
-				return fmt.Errorf("snapshot %q is corrupted: %w", name, err)
 			}
 			infos = append(infos, SnapshotInfo{Name: name, Count: len(snap.Entries)})
 			return nil
 		})
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
 	})
 	if err != nil {
 		return nil, err
