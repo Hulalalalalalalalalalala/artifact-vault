@@ -58,45 +58,117 @@ func (s *Store) CreateSnapshot(name string) (Snapshot, error) {
 	return snap, nil
 }
 
-// ListSnapshots returns every saved snapshot sorted by name. A repository
-// with no snapshots yields an empty list.
+// ListSnapshots returns every saved snapshot, sorted by its complete snapshot
+// name, with the number of artifact records in its entries mapping.
+//
+// A snapshot is listed only after its record proves complete and legal: it is
+// validated exactly the way RestoreSnapshot validates the record it restores
+// (see decodeSnapshotRecord) — a single JSON object whose recorded name
+// equals its filing name in full ("releases/stable", never just "stable"),
+// with a present, object-valued entries mapping ({} is a legitimate empty
+// snapshot; a missing or null entries field is corruption) containing only
+// valid artifact records. The content objects the entries reference are not
+// read or checked; listing depends on neither the objects nor the health of
+// the current name mapping.
+//
+// One damaged, unreadable, or misplaced record fails the whole operation:
+// the error names the complete snapshot and what is wrong with it and no
+// SnapshotInfo is returned, so callers never see a partial list or read a
+// name or count off a corrupt record. A repository whose snapshots directory
+// does not exist yet simply has no snapshots and yields an empty list; a
+// record read failing with "not exist" once the directory walk has started
+// is reported rather than treated as absence. Non-snapshot files (temporary
+// files and anything not ending in .json) are ignored. Listing never
+// modifies the current mapping, any snapshot record, or any content object.
 func (s *Store) ListSnapshots() ([]SnapshotInfo, error) {
 	infos := []SnapshotInfo{}
 	err := s.withLock(false, func() error {
-		dir := s.snapshotsDir()
-		err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
-				return nil
-			}
-			rel, err := filepath.Rel(dir, path)
-			if err != nil {
-				return err
-			}
-			name := strings.TrimSuffix(filepath.ToSlash(rel), ".json")
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			var snap Snapshot
-			if err := json.Unmarshal(data, &snap); err != nil {
-				return fmt.Errorf("snapshot %q is corrupted: %w", name, err)
-			}
+		return s.walkSnapshotRecords(func(name string, snap Snapshot) error {
 			infos = append(infos, SnapshotInfo{Name: name, Count: len(snap.Entries)})
 			return nil
 		})
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
 	return infos, nil
+}
+
+// walkSnapshotRecords enumerates the snapshot records filed under snapshots/
+// and invokes fn with each record's complete snapshot name and its parsed,
+// fully validated contents (see decodeSnapshotRecord). It is the single
+// enumeration used by read-only operations that must see exactly the records
+// restore would accept — listing and reference collection alike.
+//
+// A missing snapshots directory means no snapshots exist and is not an error.
+// Every other problem aborts the walk: a symlinked or non-directory snapshots
+// path, a symlink or other non-regular file beneath it, a .json file whose
+// location does not encode a legal snapshot name, a record that cannot be
+// read (including one that disappears mid-walk), and any malformed or
+// incomplete record. Errors name the complete snapshot when its location is
+// known. Files without a .json suffix (temporary files and other stray data)
+// are skipped.
+func (s *Store) walkSnapshotRecords(fn func(name string, snap Snapshot) error) error {
+	dir := s.snapshotsDir()
+	info, err := os.Lstat(dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("cannot inspect snapshots directory: %w", err)
+	case info.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("snapshots path %q is a symbolic link", dir)
+	case !info.IsDir():
+		return fmt.Errorf("snapshots path %q is not a directory", dir)
+	}
+	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// The directory entry was seen but the path can no longer be
+			// accessed: a vanished record is a read failure, not an empty set.
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		isRecord := strings.HasSuffix(d.Name(), ".json")
+		// Name the snapshot when the offending path occupies a record slot;
+		// other stray entries are identified by path.
+		if d.Type()&os.ModeSymlink != 0 {
+			if isRecord {
+				name := strings.TrimSuffix(filepath.ToSlash(rel), ".json")
+				return fmt.Errorf("snapshot %q is a symbolic link", name)
+			}
+			return fmt.Errorf("snapshots contain symbolic link %q", path)
+		}
+		if !d.Type().IsRegular() {
+			if isRecord {
+				name := strings.TrimSuffix(filepath.ToSlash(rel), ".json")
+				return fmt.Errorf("snapshot %q is not a regular file", name)
+			}
+			return fmt.Errorf("snapshots contain non-regular file %q", path)
+		}
+		if !isRecord {
+			return nil
+		}
+		name := strings.TrimSuffix(filepath.ToSlash(rel), ".json")
+		if err := validateName(name); err != nil {
+			return fmt.Errorf("snapshot record %q does not map to a valid snapshot name: %w", path, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("snapshot %q cannot be read: %w", name, err)
+		}
+		snap, err := decodeSnapshotRecord(data, name)
+		if err != nil {
+			return fmt.Errorf("snapshot %q is corrupted: %w", name, err)
+		}
+		return fn(name, snap)
+	})
 }
 
 // RestoreSnapshot replaces the current name mapping with the snapshot's

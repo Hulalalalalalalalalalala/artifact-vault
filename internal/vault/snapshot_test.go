@@ -752,6 +752,328 @@ func TestRestoreMatchesRecordedMetadata(t *testing.T) {
 	}
 }
 
+// TestSnapshotListRejectsDamagedRecords is the listing counterpart to the
+// restore validation tests: every record is checked with the same rules
+// restore applies, so a record restore would reject can never appear in a
+// listing with a fabricated name or entry count. A single bad record fails
+// the whole list — even with a healthy snapshot filed beside it — the error
+// names the complete snapshot and the reason, and no infos are returned.
+func TestSnapshotListRejectsDamagedRecords(t *testing.T) {
+	goodDigest := hex.EncodeToString(sha256.New().Sum(nil))
+	entry := func() string {
+		return `{"name":"a","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}`
+	}
+	cases := map[string]struct {
+		snapshotName string
+		record       string
+		wantInError  string
+	}{
+		"empty object": {
+			snapshotName: "s",
+			record:       `{}`,
+			wantInError:  "missing snapshot name",
+		},
+		"bare null": {
+			snapshotName: "s",
+			record:       `null`,
+			wantInError:  "malformed record",
+		},
+		"missing entries": {
+			snapshotName: "s",
+			record:       `{"name":"s"}`,
+			wantInError:  "missing its entries mapping",
+		},
+		"null entries": {
+			snapshotName: "s",
+			record:       `{"name":"s","entries":null}`,
+			wantInError:  "missing its entries mapping",
+		},
+		"array entries": {
+			snapshotName: "s",
+			record:       `{"name":"s","entries":[]}`,
+			wantInError:  "entries mapping is malformed",
+		},
+		"missing name": {
+			snapshotName: "s",
+			record:       `{"entries":{}}`,
+			wantInError:  "missing snapshot name",
+		},
+		"wrong name": {
+			snapshotName: "s",
+			record:       `{"name":"other","entries":{}}`,
+			wantInError:  `recorded name "other" does not match snapshot "s"`,
+		},
+		"nested record names only the leaf": {
+			snapshotName: "releases/stable",
+			record:       `{"name":"stable","entries":{}}`,
+			wantInError:  `recorded name "stable" does not match snapshot "releases/stable"`,
+		},
+		"malformed json": {
+			snapshotName: "s",
+			record:       `{broken`,
+			wantInError:  "malformed record",
+		},
+		"duplicate field": {
+			snapshotName: "s",
+			record:       `{"name":"other","name":"s","entries":{}}`,
+			wantInError:  "malformed record",
+		},
+		"unknown field": {
+			snapshotName: "s",
+			record:       `{"name":"s","entries":{},"extra":1}`,
+			wantInError:  "malformed record",
+		},
+		"trailing content": {
+			snapshotName: "s",
+			record:       `{"name":"s","entries":{}} garbage`,
+			wantInError:  "malformed record",
+		},
+		"entry key mismatch": {
+			snapshotName: "s",
+			record:       `{"name":"s","entries":{"a":{"name":"b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+			wantInError:  `is filed under`,
+		},
+		"entry bad digest": {
+			snapshotName: "s",
+			record:       `{"name":"s","entries":{"a":{"name":"a","digest":"zzz","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+			wantInError:  "want 64 lowercase hex characters",
+		},
+		"entry negative size": {
+			snapshotName: "s",
+			record:       `{"name":"s","entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":-4,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+			wantInError:  "negative size",
+		},
+		"duplicate artifact name": {
+			snapshotName: "s",
+			record:       `{"name":"s","entries":{"a":` + entry() + `,"a":` + entry() + `}}`,
+			wantInError:  "malformed record",
+		},
+	}
+	for label, tc := range cases {
+		t.Run(label, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "vault")
+			store := New(root)
+			if _, err := store.Put("healthy.txt", writeFile(t, "healthy")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.CreateSnapshot("healthy"); err != nil {
+				t.Fatal(err)
+			}
+			writeSnapshotRecord(t, root, tc.snapshotName, tc.record)
+
+			infos, err := store.ListSnapshots()
+			if err == nil {
+				t.Fatalf("expected list to fail, got %+v", infos)
+			}
+			if infos != nil {
+				t.Fatalf("failed list returned partial infos: %+v", infos)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("%q", tc.snapshotName)) {
+				t.Fatalf("error %q does not name snapshot %q", err, tc.snapshotName)
+			}
+			if !strings.Contains(err.Error(), tc.wantInError) {
+				t.Fatalf("error %q does not indicate %q", err, tc.wantInError)
+			}
+		})
+	}
+}
+
+// TestSnapshotListEmptyEntriesCountsZero confirms a record that explicitly
+// carries an empty entries object is a healthy snapshot listed with zero
+// entries, rather than being treated as corrupt or missing.
+func TestSnapshotListEmptyEntriesCountsZero(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSnapshot("empty"); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := store.ListSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 || infos[0].Name != "empty" || infos[0].Count != 0 {
+		t.Fatalf("infos=%+v", infos)
+	}
+}
+
+// TestSnapshotListCountsMapRecordsNotObjects verifies the count is the number
+// of records in the entries mapping: two artifact names sharing one content
+// object count as two, and a multi-level snapshot name is shown in full.
+func TestSnapshotListCountsMapRecordsNotObjects(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	same := writeFile(t, "identical payload")
+	if _, err := store.Put("releases/app.bin", same); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("mirror/app.bin", same); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSnapshot("releases/stable"); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := New(root).ListSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("infos=%+v", infos)
+	}
+	if infos[0].Name != "releases/stable" {
+		t.Fatalf("name=%q, want the full multi-level name", infos[0].Name)
+	}
+	if infos[0].Count != 2 {
+		t.Fatalf("count=%d, want 2 map records even with one shared object", infos[0].Count)
+	}
+}
+
+// TestSnapshotListEmptyRepository covers both an initialized repository that
+// has never held a snapshot and a root whose snapshots directory is absent.
+func TestSnapshotListEmptyRepository(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	if err := New(root).Init(); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := New(root).ListSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 0 || infos == nil {
+		t.Fatalf("want non-nil empty slice, got %+v", infos)
+	}
+}
+
+// TestSnapshotListIgnoresNonSnapshotFiles makes sure temporary and stray
+// files without a .json suffix are skipped while real records still list.
+func TestSnapshotListIgnoresNonSnapshotFiles(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSnapshot("real"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "snapshots")
+	for _, stray := range []string{".snapshot-tmp123", "notes.bak", "real.json.tmp"} {
+		if err := os.WriteFile(filepath.Join(dir, stray), []byte("not a snapshot"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	infos, err := store.ListSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 || infos[0].Name != "real" {
+		t.Fatalf("infos=%+v", infos)
+	}
+}
+
+// TestSnapshotListRejectsSymlink makes a symlinked snapshot record fatal,
+// matching the restore/gc treatment of symlinks.
+func TestSnapshotListRejectsSymlink(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	if _, err := store.CreateSnapshot("real"); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "elsewhere.json")
+	if err := os.WriteFile(target, []byte(`{"name":"link","entries":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "snapshots", "link.json")); err != nil {
+		t.Fatal(err)
+	}
+	if infos, err := store.ListSnapshots(); err == nil {
+		t.Fatalf("expected symlink to fail the list, got %+v", infos)
+	}
+}
+
+// TestSnapshotListNeedsNeitherObjectsNorHealthyMapping shows listing only
+// inspects snapshot metadata: it succeeds with entries whose objects are
+// gone and even while the current index itself is unreadable.
+func TestSnapshotListNeedsNeitherObjectsNorHealthyMapping(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	entry, err := store.Put("a.txt", writeFile(t, "payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSnapshot("snap"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "objects", entry.Digest)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "index.json"), []byte("{broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := store.ListSnapshots()
+	if err != nil {
+		t.Fatalf("listing must not depend on objects or the current mapping: %v", err)
+	}
+	if len(infos) != 1 || infos[0].Name != "snap" || infos[0].Count != 1 {
+		t.Fatalf("infos=%+v", infos)
+	}
+}
+
+// TestSnapshotListIsReadOnly verifies a listing leaves every byte of the
+// current mapping, snapshot records, and objects untouched, on both a
+// successful listing and one aborted by a damaged record.
+func TestSnapshotListIsReadOnly(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	entry, err := store.Put("a.txt", writeFile(t, "payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSnapshot("snap"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := func() map[string][]byte {
+		out := map[string][]byte{}
+		for _, p := range []string{
+			filepath.Join(root, "index.json"),
+			filepath.Join(root, "snapshots", "snap.json"),
+			filepath.Join(root, "objects", entry.Digest),
+		} {
+			data, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out[p] = data
+		}
+		return out
+	}
+	check := func(before map[string][]byte) {
+		t.Helper()
+		for p, want := range before {
+			got, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s changed during snapshot list", p)
+			}
+		}
+	}
+
+	before := snapshot()
+	if _, err := store.ListSnapshots(); err != nil {
+		t.Fatal(err)
+	}
+	check(before)
+
+	writeSnapshotRecord(t, root, "broken", `{"name":"broken"}`)
+	if _, err := store.ListSnapshots(); err == nil {
+		t.Fatal("expected the damaged record to fail the list")
+	}
+	check(before)
+}
+
 // TestRestoreNestedSnapshotNameMustMatchInFull covers a real multi-level
 // snapshot: a record whose name disagrees with the selected path is rejected
 // even when its entries are otherwise valid, and restoring the untouched

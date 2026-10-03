@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -131,50 +130,10 @@ func (s *Store) collectReferences() (map[string]struct{}, error) {
 		}
 		referenced[entry.Digest] = struct{}{}
 	}
-	dir := s.snapshotsDir()
-	info, err := os.Lstat(dir)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return referenced, nil
-	case err != nil:
-		return nil, fmt.Errorf("cannot inspect snapshots directory: %w", err)
-	case info.Mode()&os.ModeSymlink != 0:
-		return nil, fmt.Errorf("snapshots path %q is a symbolic link", dir)
-	case !info.IsDir():
-		return nil, fmt.Errorf("snapshots path %q is not a directory", dir)
-	}
-	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("snapshots contain symbolic link %q", path)
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return fmt.Errorf("snapshots contain non-regular file %q", path)
-		}
-		if !strings.HasSuffix(d.Name(), ".json") {
-			return nil
-		}
-		rel, err := filepath.Rel(dir, path)
-		if err != nil {
-			return err
-		}
-		name := strings.TrimSuffix(filepath.ToSlash(rel), ".json")
-		if err := validateName(name); err != nil {
-			return fmt.Errorf("snapshot record %q does not map to a valid snapshot name: %w", path, err)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		snap, err := decodeSnapshotRecord(data, name)
-		if err != nil {
-			return fmt.Errorf("snapshot %q is corrupted: %w", name, err)
-		}
+	// Every snapshot record is enumerated and validated exactly as list and
+	// restore see it: a damaged or unreadable record aborts reference
+	// collection before anything is deleted.
+	err = s.walkSnapshotRecords(func(_ string, snap Snapshot) error {
 		for _, entry := range snap.Entries {
 			referenced[entry.Digest] = struct{}{}
 		}

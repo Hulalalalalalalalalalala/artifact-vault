@@ -105,6 +105,90 @@ func TestSnapshotRestoreCLI(t *testing.T) {
 	}
 }
 
+// TestSnapshotListCLIAtomicOnCorruption confirms the command line applies
+// the same rules as the Go API: healthy snapshots print one
+// "name<TAB>count" line sorted by their full name, but a damaged record
+// aborts the whole command with no prior snapshot lines on stdout.
+func TestSnapshotListCLIAtomicOnCorruption(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	if err := run([]string{"init", "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(input, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", root, "--name", "a.txt", "--file", input}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"releases/stable", "zeta", "alpha"} {
+		if err := run([]string{"snapshot", "create", "--root", root, "--name", name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out := captureStdout(t, func() {
+		if err := run([]string{"snapshot", "list", "--root", root}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	want := "alpha\t1\nreleases/stable\t1\nzeta\t1\n"
+	if out != want {
+		t.Fatalf("list output=%q, want %q", out, want)
+	}
+
+	// A healthy explicit empty-entries snapshot lists with zero entries.
+	if err := run([]string{"snapshot", "create", "--root", root, "--name", "empty"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "snapshots", "empty.json"),
+		[]byte(`{"name":"empty","entries":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() {
+		if err := run([]string{"snapshot", "list", "--root", root}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "empty\t0\n") {
+		t.Fatalf("empty snapshot not listed with zero entries: %q", out)
+	}
+
+	// Damage one record: the command must fail and print nothing at all, even
+	// though three healthy snapshots were read alongside it.
+	if err := os.WriteFile(filepath.Join(root, "snapshots", "zeta.json"),
+		[]byte(`{"name":"zeta"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var listErr error
+	out = captureStdout(t, func() {
+		listErr = run([]string{"snapshot", "list", "--root", root})
+	})
+	if listErr == nil {
+		t.Fatal("expected list with a damaged record to fail")
+	}
+	if !strings.Contains(listErr.Error(), `snapshot "zeta" is corrupted`) {
+		t.Fatalf("error %q does not identify the damaged snapshot", listErr)
+	}
+	if out != "" {
+		t.Fatalf("a failed list must leave no snapshot lines on stdout, got %q", out)
+	}
+
+	// A repository that has never held a snapshot succeeds with empty output.
+	fresh := filepath.Join(t.TempDir(), "vault")
+	if err := run([]string{"init", "--root", fresh}); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() {
+		if err := run([]string{"snapshot", "list", "--root", fresh}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if out != "" {
+		t.Fatalf("fresh repository listed output: %q", out)
+	}
+}
+
 // TestSnapshotRestoreCLIMissingName fails without a success line when the
 // snapshot does not exist, distinguishing "not found" from corruption.
 func TestSnapshotRestoreCLIMissingName(t *testing.T) {
