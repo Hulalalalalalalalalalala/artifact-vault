@@ -105,6 +105,52 @@ func TestSnapshotRestoreCLI(t *testing.T) {
 	}
 }
 
+// TestVerifyCLI confirms the command line follows the Go API: a healthy
+// repository prints "verified N artifacts" counted by artifact name, while a
+// corrupt current index fails the command and prints no success line.
+func TestVerifyCLI(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	input := filepath.Join(t.TempDir(), "in.bin")
+	if err := os.WriteFile(input, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.bin", "b.bin"} {
+		if err := run([]string{"put", "--root", root, "--name", name, "--file", input}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := captureStdout(t, func() {
+		if err := run([]string{"verify", "--root", root}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "verified 2 artifacts") {
+		t.Fatalf("healthy verify did not count both names: %q", out)
+	}
+
+	// Damage the mapping: a null entries field is corruption, not an empty
+	// repository, and must not produce a success line.
+	if err := os.WriteFile(filepath.Join(root, "index.json"), []byte(`{"entries":null}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var verifyErr error
+	out = captureStdout(t, func() {
+		verifyErr = run([]string{"verify", "--root", root})
+	})
+	if verifyErr == nil {
+		t.Fatal("expected verify of a corrupt index to fail")
+	}
+	if !strings.Contains(verifyErr.Error(), "current index") {
+		t.Fatalf("error does not identify the current index: %v", verifyErr)
+	}
+	if strings.Contains(out, "verified") {
+		t.Fatalf("failed verify printed a success line: %q", out)
+	}
+}
+
 // TestSnapshotListCLIAtomicOnCorruption confirms the command line applies
 // the same rules as the Go API: healthy snapshots print one
 // "name<TAB>count" line sorted by their full name, but a damaged record

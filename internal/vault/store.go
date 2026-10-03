@@ -235,25 +235,51 @@ func (s *Store) List() ([]Entry, error) {
 
 // Verify checks every entry of the current name mapping against its content
 // object: the object must exist and its actual size and SHA-256 must match
-// the recorded metadata. The whole pass — reading the mapping and checking
-// every object it references — runs under one shared repository lock, so the
-// mapping and the objects it points at cannot be replaced or collected by
-// another process between the first read and the last check: an overwrite,
-// snapshot restore, import, or gc either completes before the pass starts
-// (and the pass observes the completed state) or waits until the pass ends.
-// The lock is shared, so concurrent lists, downloads, and other verifies
-// proceed alongside it. Verify never rewrites the mapping, snapshots, or
-// objects, and never repairs damaged content; on the first failure it
-// reports the artifact name and returns a zero count.
+// the recorded metadata. Success is reported only when the name mapping
+// itself is complete and unambiguous and every object it references passes
+// the content check.
+//
+// The mapping is held to the same standard download and garbage collection
+// already apply (see loadStrict and validateEntryRecord): the index must be
+// one complete JSON object with an explicitly present, object-valued entries
+// mapping — a genuine {"entries":{}} is a legitimate empty repository, but a
+// missing or null entries field, a bare null, an array, truncated JSON,
+// trailing content, or any duplicate key (a repeated entries mapping, a
+// repeated artifact name, or a repeated field inside one record, even with
+// identical values and even when one spelling uses Unicode escapes) is
+// corruption, never an empty mapping. Every record must be filed under its
+// recorded name, carry a legal name, a 64-character lowercase-hex digest,
+// and a non-negative size; a single illegal record fails the whole pass
+// rather than being skipped. Mapping problems are reported as a corrupt
+// current index — naming the duplicated key or the artifact name of the
+// illegal record — before and separately from any object corruption, even
+// when objects are damaged too.
+//
+// The whole pass — reading the mapping and checking every object it
+// references — runs under one shared repository lock, so the mapping and the
+// objects it points at cannot be replaced or collected by another process
+// between the first read and the last check: an overwrite, snapshot restore,
+// import, or gc either completes before the pass starts (and the pass
+// observes the completed state) or waits until the pass ends. The lock is
+// shared, so concurrent lists, downloads, and other verifies proceed
+// alongside it. Verify never rewrites the mapping, snapshots, or objects,
+// never repairs damaged content, and never looks beyond the current mapping
+// (snapshots and unreferenced objects are not its concern). On the first
+// failure it reports the artifact name and returns a zero count; a healthy
+// repository is counted by artifact name, so two names sharing one digest
+// count as two and empty objects take part like any other.
 func (s *Store) Verify() (int, error) {
 	count := 0
 	err := s.withLock(false, func() error {
-		idx, err := s.load()
+		idx, err := s.loadStrict()
 		if err != nil {
 			return err
 		}
 		entries := make([]Entry, 0, len(idx.Entries))
-		for _, entry := range idx.Entries {
+		for key, entry := range idx.Entries {
+			if err := validateEntryRecord(key, entry); err != nil {
+				return fmt.Errorf("current index is corrupt: %w", err)
+			}
 			entries = append(entries, entry)
 		}
 		// Sort by name so the first reported failure is deterministic.
