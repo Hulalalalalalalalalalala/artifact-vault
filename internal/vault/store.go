@@ -93,6 +93,19 @@ func (s *Store) initLocked() error {
 	return err
 }
 
+// Put stores the content of source under name. The content is staged in a
+// temporary file inside the repository while its size and SHA-256 are
+// computed, then either installed as a new content object or matched against
+// the object already stored under the same digest. A successful put means the
+// object behind name's digest is verifiably complete: an existing object is
+// reused only when it is a regular file whose full contents can be read and
+// whose actual size and SHA-256 equal this upload's. Anything else — a
+// truncated or rewritten object, a same-size object with different bytes, a
+// symlink (followed or dangling), a directory, or an unreadable path — fails
+// the upload and leaves the name mapping, the existing object, and every
+// snapshot untouched; a damaged object is never repaired by overwriting it.
+// Reuse never copies, rewrites, or re-permissions the healthy object, so
+// several names can share one object.
 func (s *Store) Put(name, source string) (Entry, error) {
 	if err := validateName(name); err != nil {
 		return Entry{}, err
@@ -126,11 +139,8 @@ func (s *Store) Put(name, source string) (Entry, error) {
 			return closeErr
 		}
 		digest := hex.EncodeToString(hash.Sum(nil))
-		object := s.objectPath(digest)
-		if _, err := os.Stat(object); errors.Is(err, os.ErrNotExist) {
-			if err := os.Rename(tmpName, object); err != nil {
-				return err
-			}
+		if err := s.placeObject(name, digest, size, tmpName); err != nil {
+			return err
 		}
 		idx, err := s.load()
 		if err != nil {
@@ -144,6 +154,63 @@ func (s *Store) Put(name, source string) (Entry, error) {
 		return Entry{}, err
 	}
 	return entry, nil
+}
+
+// placeObject makes the content object for digest available in the
+// repository. When no object exists at the digest path yet, the staged upload
+// at tmpName is renamed into place. When something already exists there it is
+// reused only if it proves to be a complete, intact copy of this upload (see
+// checkReusableObject); otherwise the upload fails and the staged file is
+// removed by the caller's deferred cleanup. An inspection failure is never
+// treated as "object missing": only a genuine not-exist installs new content.
+func (s *Store) placeObject(name, digest string, size int64, tmpName string) error {
+	object := s.objectPath(digest)
+	info, err := os.Lstat(object)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return os.Rename(tmpName, object)
+	case err != nil:
+		return fmt.Errorf("cannot store %q: cannot inspect existing object %s: %w", name, digest, err)
+	}
+	if err := checkReusableObject(info, object, digest, size); err != nil {
+		return fmt.Errorf("cannot store %q: %w", name, err)
+	}
+	return nil
+}
+
+// checkReusableObject verifies that an existing content object is a complete,
+// intact copy of the uploaded content: a regular file — never a symlink,
+// whether or not its target exists, and never a directory or other special
+// file — whose actual size and SHA-256 match the digest and size computed for
+// this upload. The object is read in full; a read failure is reported, not
+// treated as absence.
+func checkReusableObject(info os.FileInfo, object, digest string, size int64) error {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("existing object %s is a symbolic link", digest)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("existing object %s is not a regular file", digest)
+	}
+	file, err := os.Open(object)
+	if err != nil {
+		return fmt.Errorf("cannot read existing object %s: %w", digest, err)
+	}
+	hash := sha256.New()
+	n, copyErr := io.Copy(hash, file)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return fmt.Errorf("cannot read existing object %s: %w", digest, copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("cannot read existing object %s: %w", digest, closeErr)
+	}
+	if n != size {
+		return fmt.Errorf("existing object %s is corrupted: content is %d bytes, upload is %d", digest, n, size)
+	}
+	if actual := hex.EncodeToString(hash.Sum(nil)); actual != digest {
+		return fmt.Errorf("existing object %s is corrupted: content checksum is %s", digest, actual)
+	}
+	return nil
 }
 
 func (s *Store) List() ([]Entry, error) {
