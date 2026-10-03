@@ -189,6 +189,63 @@ func TestSnapshotListCLIAtomicOnCorruption(t *testing.T) {
 	}
 }
 
+// TestGCCLIRejectsDuplicateIndexKeys confirms the command-line gc follows the
+// Go API: an index with a duplicate JSON key is reported as a corrupt current
+// index, and neither a dry-run preview nor a real pass prints anything — no
+// candidate lines, no total summary, no deleted line — or removes an object.
+func TestGCCLIRejectsDuplicateIndexKeys(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	input := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(input, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", root, "--name", "a.txt", "--file", input}); err != nil {
+		t.Fatal(err)
+	}
+	// An unreferenced object that a working GC would collect; it must survive.
+	stray := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if err := os.WriteFile(filepath.Join(root, "objects", stray), []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest := "7692c3ad3540bb803c020b3aee66cd8887123234ea0c6e7143c0add73ff431ed"
+	index := `{"entries":{"a.txt":{"name":"a.txt","digest":"` + digest + `","size":7,"createdAt":"2026-01-01T00:00:00Z"},` +
+		`"a.txt":{"name":"a.txt","digest":"` + digest + `","size":7,"createdAt":"2026-01-01T00:00:00Z"}}}`
+	if err := os.WriteFile(filepath.Join(root, "index.json"), []byte(index), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var dryErr error
+	out := captureStdout(t, func() {
+		dryErr = run([]string{"gc", "--root", root, "--dry-run"})
+	})
+	if dryErr == nil {
+		t.Fatal("expected dry-run gc with a duplicate index key to fail")
+	}
+	if !strings.Contains(dryErr.Error(), "index") || !strings.Contains(dryErr.Error(), `"a.txt"`) {
+		t.Fatalf("error %q does not name the current index and the duplicate key", dryErr)
+	}
+	if out != "" {
+		t.Fatalf("failed dry-run printed candidate or total lines: %q", out)
+	}
+
+	var gcErr error
+	out = captureStdout(t, func() {
+		gcErr = run([]string{"gc", "--root", root})
+	})
+	if gcErr == nil {
+		t.Fatal("expected gc with a duplicate index key to fail")
+	}
+	if strings.Contains(out, "deleted") {
+		t.Fatalf("failed gc printed a success line: %q", out)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "objects", stray)); err != nil {
+		t.Fatal("failed gc deleted the unreferenced object")
+	}
+}
+
 // TestSnapshotRestoreCLIMissingName fails without a success line when the
 // snapshot does not exist, distinguishing "not found" from corruption.
 func TestSnapshotRestoreCLIMissingName(t *testing.T) {

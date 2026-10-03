@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -409,6 +411,100 @@ func TestGCRejectsCorruptReferences(t *testing.T) {
 			}
 			if !objectExists(root, entry.Digest) {
 				t.Fatal("failed GC deleted a referenced object")
+			}
+		})
+	}
+}
+
+func TestGCRejectsDuplicateIndexKeys(t *testing.T) {
+	goodDigest := digestOf("good")
+	otherDigest := digestOf("other")
+	record := func(name, digest string) string {
+		return fmt.Sprintf(`{"name":%q,"digest":%q,"size":0,"createdAt":"2026-01-01T00:00:00Z"}`, name, digest)
+	}
+	cases := map[string]struct {
+		index string
+		key   string
+	}{
+		"duplicate entries field": {
+			index: `{"entries":{},"entries":{}}`,
+			key:   "entries",
+		},
+		"duplicate artifact name": {
+			index: `{"entries":{"a.txt":` + record("a.txt", goodDigest) + `,"a.txt":` + record("a.txt", otherDigest) + `}}`,
+			key:   "a.txt",
+		},
+		"identical duplicate records": {
+			index: `{"entries":{"a.txt":` + record("a.txt", goodDigest) + `,"a.txt":` + record("a.txt", goodDigest) + `}}`,
+			key:   "a.txt",
+		},
+		"duplicate field inside record": {
+			index: `{"entries":{"a.txt":{"name":"a.txt","digest":"` + goodDigest + `","digest":"` + otherDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+			key:   "digest",
+		},
+		"unicode-escaped duplicate name": {
+			index: `{"entries":{"dir/a.txt":` + record("dir/a.txt", goodDigest) + `,"dir\u002fa.txt":` + record("dir/a.txt", otherDigest) + `}}`,
+			key:   "dir/a.txt",
+		},
+	}
+	for label, tc := range cases {
+		t.Run(label, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "vault")
+			store := New(root)
+			kept, err := store.Put("keep.txt", writeFile(t, "keep me"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.CreateSnapshot("snap"); err != nil {
+				t.Fatal(err)
+			}
+			// An unreferenced object that must survive the failed pass.
+			stray := digestOf("stray " + label)
+			if err := os.WriteFile(filepath.Join(root, "objects", stray), []byte("stray"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "index.json"), []byte(tc.index), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			indexBefore, err := os.ReadFile(filepath.Join(root, "index.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapBefore, err := os.ReadFile(filepath.Join(root, "snapshots", "snap.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, dryRun := range []bool{true, false} {
+				report, err := store.GC(dryRun)
+				if err == nil {
+					t.Fatalf("dryRun=%v: expected error", dryRun)
+				}
+				if !strings.Contains(err.Error(), "index") || !strings.Contains(err.Error(), strconv.Quote(tc.key)) {
+					t.Fatalf("dryRun=%v: error %q does not name the current index and duplicate key %q",
+						dryRun, err, tc.key)
+				}
+				if len(report.Candidates) != 0 || report.Deleted != 0 || report.Bytes != 0 {
+					t.Fatalf("dryRun=%v: report=%+v", dryRun, report)
+				}
+			}
+			// Every object survives, including the unreferenced stray, and
+			// neither the index nor the snapshot record is rewritten.
+			for _, digest := range []string{kept.Digest, stray} {
+				if !objectExists(root, digest) {
+					t.Fatalf("failed GC deleted object %s", digest)
+				}
+			}
+			for path, want := range map[string][]byte{
+				filepath.Join(root, "index.json"):             indexBefore,
+				filepath.Join(root, "snapshots", "snap.json"): snapBefore,
+			} {
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(got) != string(want) {
+					t.Fatalf("%s changed across failed GC", path)
+				}
 			}
 		})
 	}
