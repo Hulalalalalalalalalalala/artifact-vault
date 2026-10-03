@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -357,9 +356,10 @@ func (s *Store) ImportSnapshot(file string) (ImportResult, error) {
 	return result, nil
 }
 
-// loadSnapshotRecord reads and fully validates one stored snapshot: it must
-// parse, carry a non-null entries mapping, record the same name it is filed
-// under, and contain only valid entry records.
+// loadSnapshotRecord reads and fully validates one stored snapshot: the path
+// must be a regular file (never a symlink), the document must be a single
+// well-formed object, carry a present non-null entries mapping, record the
+// same name it is filed under (in full), and contain only valid entry records.
 func (s *Store) loadSnapshotRecord(name string) (Snapshot, error) {
 	path := s.snapshotPath(name)
 	info, err := os.Lstat(path)
@@ -379,20 +379,9 @@ func (s *Store) loadSnapshotRecord(name string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	var snap Snapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
+	snap, err := decodeSnapshotRecord(data, name)
+	if err != nil {
 		return Snapshot{}, fmt.Errorf("snapshot %q is corrupted: %w", name, err)
-	}
-	if snap.Entries == nil {
-		return Snapshot{}, fmt.Errorf("snapshot %q is corrupted: missing entries mapping", name)
-	}
-	if snap.Name != name {
-		return Snapshot{}, fmt.Errorf("snapshot %q is corrupted: recorded name %q does not match its location", name, snap.Name)
-	}
-	for key, entry := range snap.Entries {
-		if err := validateEntryRecord(key, entry); err != nil {
-			return Snapshot{}, fmt.Errorf("snapshot %q is corrupted: %w", name, err)
-		}
 	}
 	return snap, nil
 }

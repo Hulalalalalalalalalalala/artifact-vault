@@ -1,9 +1,11 @@
 package vault
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -99,9 +101,16 @@ func (s *Store) ListSnapshots() ([]SnapshotInfo, error) {
 
 // RestoreSnapshot replaces the current name mapping with the snapshot's
 // recorded mapping in a single atomic index write. The current index is never
-// read, so restore works even when it is corrupted. Every referenced object
-// is checked for existence, size, and SHA-256 before the mapping is swapped;
-// any failure leaves the current mapping and all snapshots untouched.
+// read, so restore works even when it is corrupted. The selected snapshot
+// record must be a complete, well-formed document whose recorded name equals
+// the selected snapshot name in full (a record nested under "releases/stable"
+// must itself say "releases/stable", never just "stable") and whose entries
+// mapping is present and an object ({} is a legitimate empty snapshot; a
+// missing, null, or non-object entries field is corruption, never an empty
+// mapping). Every referenced object is checked for existence, size, and
+// SHA-256 before the mapping is swapped; any failure leaves the current
+// mapping's bytes and all snapshots and objects untouched, even when the
+// current mapping itself is already corrupted.
 func (s *Store) RestoreSnapshot(name string) error {
 	if err := validateName(name); err != nil {
 		return err
@@ -110,33 +119,9 @@ func (s *Store) RestoreSnapshot(name string) error {
 		if err := s.initLocked(); err != nil {
 			return err
 		}
-		data, err := os.ReadFile(s.snapshotPath(name))
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("snapshot %q not found", name)
-		}
+		snap, err := s.loadSnapshotRecord(name)
 		if err != nil {
 			return err
-		}
-		var snap Snapshot
-		if err := json.Unmarshal(data, &snap); err != nil {
-			return fmt.Errorf("snapshot %q is corrupted: %w", name, err)
-		}
-		if snap.Entries == nil {
-			snap.Entries = map[string]Entry{}
-		}
-		for key, entry := range snap.Entries {
-			if entry.Name != key {
-				return fmt.Errorf("snapshot %q is corrupted: entry %q is filed under %q", name, entry.Name, key)
-			}
-			if err := validateName(entry.Name); err != nil {
-				return fmt.Errorf("snapshot %q is corrupted: invalid entry name %q", name, entry.Name)
-			}
-			if !isDigest(entry.Digest) {
-				return fmt.Errorf("snapshot %q is corrupted: entry %q has digest %q, want 64 lowercase hex characters", name, entry.Name, entry.Digest)
-			}
-			if entry.Size < 0 {
-				return fmt.Errorf("snapshot %q is corrupted: entry %q has negative size %d", name, entry.Name, entry.Size)
-			}
 		}
 		for _, entry := range snap.Entries {
 			if err := s.verifyObject(entry); err != nil {
@@ -145,6 +130,77 @@ func (s *Store) RestoreSnapshot(name string) error {
 		}
 		return s.save(index{Entries: snap.Entries})
 	})
+}
+
+// decodeSnapshotRecord parses one snapshot record without touching the
+// repository. wantName is the full snapshot name the record is selected or
+// filed under and must record verbatim.
+//
+// A valid record is exactly one JSON object — never the bare null — with no
+// duplicate or unknown fields and no trailing data, carrying:
+//
+//   - "name": present and a string equal to wantName, including every level of
+//     a multi-level name; a missing, wrong-type, or merely-suffixed name
+//     (record "stable" under "releases/stable") is refused;
+//   - "entries": present and a JSON object. {} is a legitimate empty mapping;
+//     a missing field, a null, an array, or any non-object value is
+//     corruption rather than zero entries.
+//
+// Every entry is then checked with validateEntryRecord. The errors
+// distinguish a missing entries mapping, a mismatching recorded name, and a
+// malformed document so callers can tell record corruption apart from a
+// snapshot that simply does not exist (that distinction is made by the
+// caller, which checks the file before reading it).
+func decodeSnapshotRecord(data []byte, wantName string) (Snapshot, error) {
+	if err := rejectDuplicateKeys(data); err != nil {
+		return Snapshot{}, fmt.Errorf("malformed record: %w", err)
+	}
+	// The document must be a JSON object: a bare null, array, or primitive is
+	// a malformed record, never an empty snapshot.
+	if trimmed := bytes.TrimSpace(data); len(trimmed) == 0 || trimmed[0] != '{' {
+		return Snapshot{}, errors.New("malformed record: expected a JSON object with name and entries")
+	}
+	var raw struct {
+		Name    *string          `json:"name"`
+		Entries *json.RawMessage `json:"entries"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return Snapshot{}, fmt.Errorf("malformed record: %w", err)
+	}
+	if tok, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return Snapshot{}, fmt.Errorf("malformed record: unexpected trailing content after the snapshot object (%v)", tok)
+		}
+		return Snapshot{}, fmt.Errorf("malformed record: %w", err)
+	}
+	if raw.Name == nil {
+		return Snapshot{}, errors.New("malformed record: missing snapshot name")
+	}
+	if *raw.Name != wantName {
+		return Snapshot{}, fmt.Errorf("recorded name %q does not match snapshot %q", *raw.Name, wantName)
+	}
+	if raw.Entries == nil {
+		return Snapshot{}, errors.New("record is missing its entries mapping")
+	}
+	entriesJSON := *raw.Entries
+	if string(bytes.TrimSpace(entriesJSON)) == "null" {
+		return Snapshot{}, errors.New("record is missing its entries mapping")
+	}
+	var entries map[string]Entry
+	if err := json.Unmarshal(entriesJSON, &entries); err != nil {
+		return Snapshot{}, fmt.Errorf("entries mapping is malformed: %w", err)
+	}
+	if entries == nil {
+		return Snapshot{}, errors.New("record is missing its entries mapping")
+	}
+	for key, entry := range entries {
+		if err := validateEntryRecord(key, entry); err != nil {
+			return Snapshot{}, err
+		}
+	}
+	return Snapshot{Name: *raw.Name, Entries: entries}, nil
 }
 
 func (s *Store) saveSnapshot(path string, snap Snapshot) error {

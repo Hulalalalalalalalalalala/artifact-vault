@@ -171,20 +171,11 @@ func (s *Store) collectReferences() (map[string]struct{}, error) {
 		if err != nil {
 			return err
 		}
-		var snap Snapshot
-		if err := json.Unmarshal(data, &snap); err != nil {
+		snap, err := decodeSnapshotRecord(data, name)
+		if err != nil {
 			return fmt.Errorf("snapshot %q is corrupted: %w", name, err)
 		}
-		if snap.Entries == nil {
-			return fmt.Errorf("snapshot %q is corrupted: missing entries mapping", name)
-		}
-		if snap.Name != name {
-			return fmt.Errorf("snapshot %q is corrupted: recorded name %q does not match its location", name, snap.Name)
-		}
-		for key, entry := range snap.Entries {
-			if err := validateEntryRecord(key, entry); err != nil {
-				return fmt.Errorf("snapshot %q is corrupted: %w", name, err)
-			}
+		for _, entry := range snap.Entries {
 			referenced[entry.Digest] = struct{}{}
 		}
 		return nil
