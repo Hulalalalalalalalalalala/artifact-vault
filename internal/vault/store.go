@@ -93,19 +93,40 @@ func (s *Store) initLocked() error {
 	return err
 }
 
-// Put stores the content of source under name. The content is staged in a
-// temporary file inside the repository while its size and SHA-256 are
-// computed, then either installed as a new content object or matched against
-// the object already stored under the same digest. A successful put means the
-// object behind name's digest is verifiably complete: an existing object is
-// reused only when it is a regular file whose full contents can be read and
-// whose actual size and SHA-256 equal this upload's. Anything else — a
-// truncated or rewritten object, a same-size object with different bytes, a
-// symlink (followed or dangling), a directory, or an unreadable path — fails
-// the upload and leaves the name mapping, the existing object, and every
-// snapshot untouched; a damaged object is never repaired by overwriting it.
-// Reuse never copies, rewrites, or re-permissions the healthy object, so
-// several names can share one object.
+// Put stores the content of source under name. Both a new name and an
+// overwrite require the entire current name mapping to be usable first: the
+// index is loaded with the same strict rules verify, gc, and snapshot creation
+// apply (one complete JSON object with an explicitly present entries mapping;
+// a genuine {"entries":{}} is a legitimate empty repository, while a bare
+// null, a missing or null entries mapping, a non-object entries value, a
+// truncated document, trailing content, or any duplicate key at any level —
+// including a name written directly and again through Unicode escapes — is
+// corruption), and every existing record is keyed by its recorded name with a
+// legal name, a 64-character lowercase-hex digest, and a non-negative size.
+// The whole mapping is validated before the input file is opened or anything
+// is staged, and a bad record unrelated to name rejects the upload just the
+// same: corruption is never rewritten into a seemingly successful put, and the
+// mapping is never cleared or saved minus the offending record.
+//
+// Once the mapping proves usable the content is staged in a temporary file
+// inside the repository while its size and SHA-256 are computed, then either
+// installed as a new content object or matched against the object already
+// stored under the same digest. A successful put means the object behind
+// name's digest is verifiably complete: an existing object is reused only when
+// it is a regular file whose full contents can be read and whose actual size
+// and SHA-256 equal this upload's. Anything else — a truncated or rewritten
+// object, a same-size object with different bytes, a symlink (followed or
+// dangling), a directory, or an unreadable path — fails the upload and leaves
+// the name mapping, the existing object, and every snapshot untouched; a
+// damaged object is never repaired by overwriting it. Reuse never copies,
+// rewrites, or re-permissions the healthy object, so several names can share
+// one object.
+//
+// Index problems are reported as "cannot store %q: current index is corrupt:
+// <reason>", with the duplicated key or offending artifact named, and stay
+// distinct from a failure reading the input file. On any failure no object is
+// installed for this upload, the index keeps its original bytes, and any
+// staged temporary file is removed.
 func (s *Store) Put(name, source string) (Entry, error) {
 	if err := validateName(name); err != nil {
 		return Entry{}, err
@@ -116,6 +137,14 @@ func (s *Store) Put(name, source string) (Entry, error) {
 	var entry Entry
 	err := s.withLock(true, func() error {
 		if err := s.initLocked(); err != nil {
+			return err
+		}
+		// The entire current mapping must be complete and unambiguous before
+		// the upload may add or overwrite a name. Validate before reading the
+		// input or staging anything, so a corrupt mapping can never be
+		// rewritten into a successful upload and a failure leaves no trace.
+		idx, err := s.loadCurrentIndexForPut(name)
+		if err != nil {
 			return err
 		}
 		in, err := os.Open(source)
@@ -142,10 +171,6 @@ func (s *Store) Put(name, source string) (Entry, error) {
 		if err := s.placeObject(name, digest, size, tmpName); err != nil {
 			return err
 		}
-		idx, err := s.load()
-		if err != nil {
-			return err
-		}
 		entry = Entry{Name: name, Digest: digest, Size: size, CreatedAt: time.Now().UTC()}
 		idx.Entries[name] = entry
 		return s.save(idx)
@@ -154,6 +179,34 @@ func (s *Store) Put(name, source string) (Entry, error) {
 		return Entry{}, err
 	}
 	return entry, nil
+}
+
+// loadCurrentIndexForPut reads the current index for an upload and validates
+// every record it holds. The structural rules loadStrict enforces for verify,
+// gc, and snapshot creation apply here too, so a missing entries mapping,
+// trailing content, or a duplicate key cannot be silently turned into an empty
+// repository by saving the upload. A malformed record unrelated to the
+// uploaded name rejects the upload as well; the underlying reason names the
+// duplicated key or offending artifact and is wrapped to name the upload and
+// the current index, which keeps it distinct from a failure to read the input
+// file or from damage to an existing content object.
+func (s *Store) loadCurrentIndexForPut(name string) (index, error) {
+	idx, err := s.loadStrict()
+	if err != nil {
+		return index{}, fmt.Errorf("cannot store %q: %w", name, err)
+	}
+	// Sorted order makes the first reported bad record deterministic.
+	keys := make([]string, 0, len(idx.Entries))
+	for key := range idx.Entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := validateEntryRecord(key, idx.Entries[key]); err != nil {
+			return index{}, fmt.Errorf("cannot store %q: current index is corrupt: %w", name, err)
+		}
+	}
+	return idx, nil
 }
 
 // placeObject makes the content object for digest available in the

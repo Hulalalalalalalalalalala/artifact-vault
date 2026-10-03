@@ -29,6 +29,59 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(data)
 }
 
+// TestPutCLISilentOnSuccessAndCorruptIndex confirms the command line never
+// prints a "stored" success line for put, and a put against a corrupt index
+// fails with an error naming the upload and the index while leaving the index
+// bytes untouched (the failure is not rewritten into a success).
+func TestPutCLISilentOnSuccessAndCorruptIndex(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	input := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(input, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := run([]string{"put", "--root", root, "--name", "a.txt", "--file", input}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if out != "" {
+		t.Fatalf("successful put must print no success line, got %q", out)
+	}
+
+	indexPath := filepath.Join(root, "index.json")
+	corrupt := []byte(`{"entries":null}`)
+	if err := os.WriteFile(indexPath, corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var putErr error
+	out = captureStdout(t, func() {
+		putErr = run([]string{"put", "--root", root, "--name", "b.txt", "--file", input})
+	})
+	if putErr == nil {
+		t.Fatal("expected put over a corrupt index to fail")
+	}
+	if !strings.Contains(putErr.Error(), `cannot store "b.txt"`) {
+		t.Fatalf("error %q does not name the upload", putErr)
+	}
+	if !strings.Contains(putErr.Error(), "current index") {
+		t.Fatalf("error %q does not identify the current index", putErr)
+	}
+	if out != "" {
+		t.Fatalf("failed put must print nothing on stdout, got %q", out)
+	}
+	got, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(corrupt) {
+		t.Fatalf("corrupt index was rewritten: %q", got)
+	}
+}
+
 // TestSnapshotCreateCLIRejectsCorruptIndex applies the same rules at the
 // command line as the Go API: a healthy create keeps its existing success
 // line, while an unusable current mapping fails with an error naming the

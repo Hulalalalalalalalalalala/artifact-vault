@@ -37,10 +37,9 @@ func run(args []string) error {
 	case "init":
 		return store.Init()
 	case "put":
-		entry, err := store.Put(*name, *file)
-		if err == nil {
-			fmt.Printf("stored %s sha256=%s size=%d\n", entry.Name, entry.Digest, entry.Size)
-		}
+		// A successful put stays silent: only errors are reported, never a
+		// "stored ..." success line.
+		_, err := store.Put(*name, *file)
 		return err
 	case "get":
 		return store.Get(*name, *output)
