@@ -106,6 +106,26 @@ func (s *Store) initLocked() error {
 // snapshot untouched; a damaged object is never repaired by overwriting it.
 // Reuse never copies, rewrites, or re-permissions the healthy object, so
 // several names can share one object.
+//
+// Adding a name and overwriting one both presuppose the whole current name
+// mapping: before the input is even read, the index must be one complete JSON
+// object with an explicitly present entries mapping under the same strict
+// rules verify and snapshot creation enforce (a genuine {"entries":{}} is a
+// legitimate empty repository; a bare null, a missing or null entries
+// mapping, a non-object mapping, truncated input or trailing content, and any
+// duplicate key at any level — including a name written directly and again
+// through Unicode escapes — is corruption), and every existing record must be
+// keyed by its recorded name with a legal name, a 64-character
+// lowercase-hex digest, and a non-negative size. One bad record rejects the
+// entire upload even when it is unrelated to this upload's name; the mapping
+// is never treated as empty, filtered, or rewritten. On such a failure the
+// index's original bytes, every snapshot, and all content objects stay in
+// place, no object for this upload's digest is added, and no staged temporary
+// file remains. Index errors name both the upload and the index problem
+// ("cannot store <name>: current index is corrupt: …", naming the duplicated
+// key or offending artifact), with an index that cannot be read reported
+// distinctly from an input file that cannot be read and from a damaged
+// content object.
 func (s *Store) Put(name, source string) (Entry, error) {
 	if err := validateName(name); err != nil {
 		return Entry{}, err
@@ -118,9 +138,20 @@ func (s *Store) Put(name, source string) (Entry, error) {
 		if err := s.initLocked(); err != nil {
 			return err
 		}
-		in, err := os.Open(source)
+		// Both a new name and an overwrite presuppose the whole current
+		// mapping: every existing key and record must be usable before this
+		// upload adds or replaces anything. This runs before the input is
+		// opened and before any temporary file is staged, so a corrupt or
+		// unreadable index fails the upload without a new content object, a
+		// leftover temporary file, or a rewritten mapping that drops the old
+		// artifact references.
+		idx, err := s.loadIndexForUpload(name)
 		if err != nil {
 			return err
+		}
+		in, err := os.Open(source)
+		if err != nil {
+			return fmt.Errorf("cannot store %q: cannot read input file %q: %w", name, source, err)
 		}
 		defer in.Close()
 		tmp, err := os.CreateTemp(filepath.Join(s.root, "objects"), ".upload-*")
@@ -133,17 +164,13 @@ func (s *Store) Put(name, source string) (Entry, error) {
 		size, copyErr := io.Copy(io.MultiWriter(tmp, hash), in)
 		closeErr := tmp.Close()
 		if copyErr != nil {
-			return copyErr
+			return fmt.Errorf("cannot store %q: cannot read input file %q: %w", name, source, copyErr)
 		}
 		if closeErr != nil {
-			return closeErr
+			return fmt.Errorf("cannot store %q: cannot stage upload: %w", name, closeErr)
 		}
 		digest := hex.EncodeToString(hash.Sum(nil))
 		if err := s.placeObject(name, digest, size, tmpName); err != nil {
-			return err
-		}
-		idx, err := s.load()
-		if err != nil {
 			return err
 		}
 		entry = Entry{Name: name, Digest: digest, Size: size, CreatedAt: time.Now().UTC()}
@@ -211,6 +238,38 @@ func checkReusableObject(info os.FileInfo, object, digest string, size int64) er
 		return fmt.Errorf("existing object %s is corrupted: content checksum is %s", digest, actual)
 	}
 	return nil
+}
+
+// loadIndexForUpload loads the current name mapping with the same strict
+// rules verify and snapshot creation enforce, then validates every record
+// before the upload is allowed to proceed. A genuine {"entries":{}} mapping
+// is a healthy empty repository; anything else — a bare null, a missing or
+// null entries mapping, a non-object mapping, a truncated document or one
+// with trailing content, any duplicate key at any level (including a name
+// written directly and again through Unicode escapes), or a record failing
+// the key-matches-name / legal-name / digest / non-negative-size rules —
+// rejects the whole upload even when the offending record is unrelated to the
+// name being uploaded. Records are checked in sorted name order so the first
+// bad record reported is deterministic. Every error names the upload and the
+// index problem ("current index is corrupt" versus "current index cannot be
+// read"), which keeps it distinct from a failure to read the upload's input
+// file and from a damaged existing content object.
+func (s *Store) loadIndexForUpload(uploadName string) (index, error) {
+	idx, err := s.loadStrict()
+	if err != nil {
+		return index{}, fmt.Errorf("cannot store %q: %w", uploadName, err)
+	}
+	keys := make([]string, 0, len(idx.Entries))
+	for key := range idx.Entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := validateEntryRecord(key, idx.Entries[key]); err != nil {
+			return index{}, fmt.Errorf("cannot store %q: current index is corrupt: %w", uploadName, err)
+		}
+	}
+	return idx, nil
 }
 
 func (s *Store) List() ([]Entry, error) {

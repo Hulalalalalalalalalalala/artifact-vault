@@ -29,6 +29,74 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(data)
 }
 
+// TestPutCLIRejectsCorruptIndexSilently applies the strict mapping
+// precondition at the command line: a healthy put keeps its existing success
+// line, but a put over a damaged index fails naming the upload and the index
+// problem, prints no stored success line, and leaves the mapping and objects
+// untouched.
+func TestPutCLIRejectsCorruptIndexSilently(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	input := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(input, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := run([]string{"put", "--root", root, "--name", "keep.txt", "--file", input}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "stored keep.txt ") {
+		t.Fatalf("a healthy put must keep its existing success line, got %q", out)
+	}
+
+	indexPath := filepath.Join(root, "index.json")
+	indexBefore, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Duplicate artifact key: corruption, never a mapping to overwrite.
+	corrupt := []byte(`{"entries":{` +
+		`"keep.txt":{"name":"keep.txt","digest":"` + strings.Repeat("a", 64) + `","size":7,"createdAt":"2026-01-01T00:00:00Z"},` +
+		`"keep.txt":{"name":"keep.txt","digest":"` + strings.Repeat("a", 64) + `","size":7,"createdAt":"2026-01-01T00:00:00Z"}` +
+		`}}`)
+	if err := os.WriteFile(indexPath, corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var putErr error
+	out = captureStdout(t, func() {
+		putErr = run([]string{"put", "--root", root, "--name", "new.txt", "--file", input})
+	})
+	if putErr == nil {
+		t.Fatal("expected put over a corrupt index to fail")
+	}
+	if !strings.Contains(putErr.Error(), `cannot store "new.txt"`) {
+		t.Fatalf("error %q does not name the upload", putErr)
+	}
+	if !strings.Contains(putErr.Error(), "current index is corrupt") ||
+		!strings.Contains(putErr.Error(), `duplicate key "keep.txt"`) {
+		t.Fatalf("error %q does not name the corrupt index and duplicated key", putErr)
+	}
+	if out != "" {
+		t.Fatalf("failed put must print no stored success line, got %q", out)
+	}
+
+	indexAfter, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(indexAfter) != string(corrupt) {
+		t.Fatalf("corrupt index was rewritten\nwas: %s\nnow: %s", corrupt, indexAfter)
+	}
+	if string(indexAfter) == string(indexBefore) {
+		t.Fatal("test setup did not damage the index")
+	}
+}
+
 // TestSnapshotCreateCLIRejectsCorruptIndex applies the same rules at the
 // command line as the Go API: a healthy create keeps its existing success
 // line, while an unusable current mapping fails with an error naming the

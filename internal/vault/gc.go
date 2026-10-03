@@ -165,7 +165,10 @@ func (s *Store) loadStrict() (index, error) {
 		return index{}, fmt.Errorf("repository %q is not initialized: index.json is missing", s.root)
 	}
 	if err != nil {
-		return index{}, err
+		// The index exists but its bytes cannot be read at all: report that
+		// distinctly from bytes that are present but malformed, so callers can
+		// name an unreadable index without calling it corrupt.
+		return index{}, fmt.Errorf("current index cannot be read: %w", err)
 	}
 	if err := rejectDuplicateKeys(data); err != nil {
 		return index{}, fmt.Errorf("current index is corrupt: %w", err)
