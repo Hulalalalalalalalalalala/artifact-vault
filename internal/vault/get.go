@@ -49,16 +49,12 @@ func (s *Store) Get(name, output string) error {
 
 func (s *Store) getLocked(name, output string) error {
 	// The index and every record it holds must be usable before any object is
-	// read. A missing or malformed record is reported as record corruption,
-	// distinct from a name that simply does not exist.
+	// read. loadStrict validates the whole mapping (structure and every
+	// record); a missing or malformed record is reported as record
+	// corruption, distinct from a name that simply does not exist.
 	idx, err := s.loadStrict()
 	if err != nil {
 		return fmt.Errorf("artifact %q: record is corrupted: %w", name, err)
-	}
-	for key, entry := range idx.Entries {
-		if err := validateEntryRecord(key, entry); err != nil {
-			return fmt.Errorf("artifact %q: record is corrupted: %w", name, err)
-		}
 	}
 	entry, ok := idx.Entries[name]
 	if !ok {

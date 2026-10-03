@@ -29,6 +29,70 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(data)
 }
 
+// TestSnapshotCreateCLISilentAndValidating covers snapshot creation on the
+// command line: a successful creation prints nothing, while a damaged current
+// index fails with no snapshot created and no success line, under the exact
+// same rules as the Go API.
+func TestSnapshotCreateCLISilentAndValidating(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	input := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(input, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", root, "--name", "a.txt", "--file", input}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := run([]string{"snapshot", "create", "--root", root, "--name", "s"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if out != "" {
+		t.Fatalf("successful snapshot create must print nothing, got %q", out)
+	}
+
+	// Corrupt the current index; creation must refuse and leave no record.
+	if err := os.WriteFile(filepath.Join(root, "index.json"), []byte(`{"entries":null}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var createErr error
+	out = captureStdout(t, func() {
+		createErr = run([]string{"snapshot", "create", "--root", root, "--name", "s2"})
+	})
+	if createErr == nil {
+		t.Fatal("expected CLI create on a damaged index to fail")
+	}
+	if !strings.Contains(createErr.Error(), `cannot create snapshot "s2"`) {
+		t.Fatalf("error %q does not name the snapshot being created", createErr)
+	}
+	if !strings.Contains(createErr.Error(), "current index") {
+		t.Fatalf("error %q does not identify the current index", createErr)
+	}
+	if out != "" {
+		t.Fatalf("failed create printed a success line: %q", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "snapshots", "s2.json")); !os.IsNotExist(err) {
+		t.Fatal("failed CLI create left a snapshot record behind")
+	}
+
+	// The already-existing healthy snapshot still lists; the failed one is absent.
+	listOut := captureStdout(t, func() {
+		if err := run([]string{"snapshot", "list", "--root", root}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.HasPrefix(listOut, "s\t1\n") {
+		t.Fatalf("unexpected snapshot list: %q", listOut)
+	}
+	if strings.Contains(listOut, "s2") {
+		t.Fatalf("rejected snapshot appeared in listing: %q", listOut)
+	}
+}
+
 // TestSnapshotRestoreCLI confirms the command-line entry point follows the
 // same restore rules as the Go API: a damaged record fails (the caller exits
 // non-zero and no success line is printed), while a healthy record restores

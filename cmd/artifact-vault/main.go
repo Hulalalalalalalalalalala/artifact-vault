@@ -97,10 +97,10 @@ func runSnapshot(args []string) error {
 	store := vault.New(*root)
 	switch sub {
 	case "create":
-		snap, err := store.CreateSnapshot(*name)
-		if err == nil {
-			fmt.Printf("snapshot %s created with %d entries\n", snap.Name, len(snap.Entries))
-		}
+		// Creation validates the current mapping and writes the record; a
+		// successful run prints nothing, while a failure is reported on
+		// stderr via run's error handling.
+		_, err := store.CreateSnapshot(*name)
 		return err
 	case "list":
 		infos, err := store.ListSnapshots()

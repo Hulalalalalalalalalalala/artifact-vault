@@ -30,6 +30,25 @@ type SnapshotInfo struct {
 // CreateSnapshot records the current name mapping under the given snapshot
 // name. The snapshot is written to a temporary file and renamed into place,
 // so a crash leaves either the complete snapshot or none at all.
+//
+// Nothing is saved unless the current index is a complete, unambiguous name
+// mapping (see loadStrict): exactly one JSON object with a present,
+// object-valued entries mapping — a true {"entries":{}} is a legitimate empty
+// repository, but a bare null, a missing or null entries field, a non-object
+// value, a truncated document, trailing content, an unknown field, or any
+// duplicate key (including a name repeated through Unicode escapes) is
+// refused — and every entry records a legal name equal to its map key, a
+// 64-character lowercase-hex digest, and a non-negative size. One bad entry
+// fails the whole creation; bad entries are never skipped to produce a
+// seemingly usable snapshot. The error names the snapshot being created and
+// what is wrong with the current index, and is distinct from an illegal
+// snapshot name or a same-named snapshot already existing. On failure no
+// snapshot record is created and the current index, existing snapshots, and
+// content objects are untouched.
+//
+// A snapshot records only metadata and references existing content objects;
+// no artifact bytes are copied. Content is checked again when the snapshot is
+// restored or exported.
 func (s *Store) CreateSnapshot(name string) (Snapshot, error) {
 	if err := validateName(name); err != nil {
 		return Snapshot{}, err
@@ -39,9 +58,9 @@ func (s *Store) CreateSnapshot(name string) (Snapshot, error) {
 		if err := s.initLocked(); err != nil {
 			return err
 		}
-		idx, err := s.load()
+		idx, err := s.loadStrict()
 		if err != nil {
-			return fmt.Errorf("cannot snapshot: current index is unreadable: %w", err)
+			return fmt.Errorf("cannot create snapshot %q: %w", name, err)
 		}
 		path := s.snapshotPath(name)
 		if _, err := os.Stat(path); err == nil {

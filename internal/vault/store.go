@@ -261,15 +261,15 @@ func (s *Store) List() ([]Entry, error) {
 func (s *Store) Verify() (int, error) {
 	count := 0
 	err := s.withLock(false, func() error {
+		// loadStrict confirms the mapping is complete and unambiguous and that
+		// every record is valid (legal name matching its key, lowercase-hex
+		// digest, non-negative size) before any object is read.
 		idx, err := s.loadStrict()
 		if err != nil {
 			return err
 		}
 		entries := make([]Entry, 0, len(idx.Entries))
-		for key, entry := range idx.Entries {
-			if err := validateEntryRecord(key, entry); err != nil {
-				return fmt.Errorf("current index is corrupt: %w", err)
-			}
+		for _, entry := range idx.Entries {
 			entries = append(entries, entry)
 		}
 		// Sort by name so the first reported failure is deterministic.
