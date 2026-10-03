@@ -127,9 +127,24 @@ func (s *Store) Put(name, source string) (Entry, error) {
 		}
 		digest := hex.EncodeToString(hash.Sum(nil))
 		object := s.objectPath(digest)
-		if _, err := os.Stat(object); errors.Is(err, os.ErrNotExist) {
+		info, statErr := os.Lstat(object)
+		switch {
+		case errors.Is(statErr, os.ErrNotExist):
+			// No object for this digest yet: stage the uploaded content.
 			if err := os.Rename(tmpName, object); err != nil {
 				return err
+			}
+		case statErr != nil:
+			// An inspection failure (permissions, I/O) is not "missing".
+			return fmt.Errorf("cannot store %q: cannot inspect existing object %s: %w", name, digest, statErr)
+		default:
+			// An object already sits at this digest. It may be reused only if
+			// it provably holds exactly the bytes just uploaded; anything else
+			// (truncated, rewritten, a symlink, a non-regular file) fails the
+			// upload rather than pointing the new name at bad content. The
+			// existing object is never repaired by overwriting it here.
+			if err := checkReusableObject(info, object, digest, size); err != nil {
+				return fmt.Errorf("cannot store %q: existing object %s is not reusable: %w", name, digest, err)
 			}
 		}
 		idx, err := s.load()
@@ -194,6 +209,42 @@ func (s *Store) verifyObject(entry Entry) error {
 	}
 	if size != entry.Size || hex.EncodeToString(hash.Sum(nil)) != entry.Digest {
 		return errors.New("content mismatch")
+	}
+	return nil
+}
+
+// checkReusableObject verifies that an object already present at path can
+// stand in for a fresh upload whose content hashes to digest and is size
+// bytes long. The object must be a regular file (a symlink is refused
+// outright, never followed, whatever its target), fully readable, and its
+// actual byte count and SHA-256 must match the uploaded content. A healthy
+// object is left untouched — same bytes, same permissions — so names that
+// already share it keep their object and no copy is made.
+func checkReusableObject(info os.FileInfo, path, digest string, size int64) error {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("path is a symbolic link")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("path is not a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("cannot read object: %w", err)
+	}
+	hash := sha256.New()
+	n, copyErr := io.Copy(hash, file)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return fmt.Errorf("cannot read object: %w", copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("cannot read object: %w", closeErr)
+	}
+	if n != size {
+		return fmt.Errorf("size mismatch: object is %d bytes, upload is %d bytes", n, size)
+	}
+	if actual := hex.EncodeToString(hash.Sum(nil)); actual != digest {
+		return fmt.Errorf("checksum mismatch: object hashes to %s, upload hashes to %s", actual, digest)
 	}
 	return nil
 }
