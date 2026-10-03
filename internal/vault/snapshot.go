@@ -28,8 +28,27 @@ type SnapshotInfo struct {
 }
 
 // CreateSnapshot records the current name mapping under the given snapshot
-// name. The snapshot is written to a temporary file and renamed into place,
-// so a crash leaves either the complete snapshot or none at all.
+// name. It first requires the current mapping itself to be complete and
+// unambiguous — the index is loaded with the same strict rules verify and gc
+// apply (a bare null, an empty {}, a missing or null entries mapping, a
+// non-object entries value, a truncated document, trailing content, or any
+// duplicate key at any level — including a name repeated through Unicode
+// escapes — is corruption, while a genuine {"entries":{}} is a legitimate
+// empty repository), and every record is keyed by its recorded name and
+// carries a legal name, a 64-character lowercase-hex digest, and a
+// non-negative size. Validation runs before anything is written and is
+// all-or-nothing: one bad record rejects the whole operation; bad entries are
+// never skipped to leave a seemingly usable partial snapshot.
+//
+// Index problems are reported as "cannot create snapshot <name>: current
+// index is corrupt: <reason>", with the duplicated key or offending artifact
+// named, distinct from an illegal snapshot name and from an existing snapshot
+// (snapshot %q already exists). On failure no snapshot record is created —
+// saveSnapshot itself writes a temporary file and renames it into place — and
+// the index's original bytes, existing snapshots, and content objects are
+// untouched. The snapshot records metadata only and references existing
+// objects; content is re-verified by restore and export under their existing
+// rules.
 func (s *Store) CreateSnapshot(name string) (Snapshot, error) {
 	if err := validateName(name); err != nil {
 		return Snapshot{}, err
@@ -39,9 +58,22 @@ func (s *Store) CreateSnapshot(name string) (Snapshot, error) {
 		if err := s.initLocked(); err != nil {
 			return err
 		}
-		idx, err := s.load()
+		idx, err := s.loadStrict()
 		if err != nil {
-			return fmt.Errorf("cannot snapshot: current index is unreadable: %w", err)
+			return fmt.Errorf("cannot create snapshot %q: %w", name, err)
+		}
+		// Validate every record before writing anything, in sorted order so the
+		// first reported bad entry is deterministic. One bad record rejects the
+		// whole snapshot; the mapping is never filtered into a partial backup.
+		keys := make([]string, 0, len(idx.Entries))
+		for key := range idx.Entries {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if err := validateEntryRecord(key, idx.Entries[key]); err != nil {
+				return fmt.Errorf("cannot create snapshot %q: current index is corrupt: %w", name, err)
+			}
 		}
 		path := s.snapshotPath(name)
 		if _, err := os.Stat(path); err == nil {

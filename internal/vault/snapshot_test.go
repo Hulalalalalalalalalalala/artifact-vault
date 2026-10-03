@@ -429,8 +429,346 @@ func TestConcurrentSnapshotAndPutSerialize(t *testing.T) {
 	}
 }
 
-// writeSnapshotRecord writes raw record content for snapshot name, creating
-// parent directories for multi-level names.
+// TestCreateSnapshotRejectsUnusableCurrentIndex is the creation-time
+// counterpart of the strict index rules verify and gc enforce: a snapshot is
+// never taken from a mapping that is not itself complete and unambiguous. A
+// bare null, an empty {}, a missing or null entries mapping, a non-object
+// entries value, a truncated document, trailing content, any duplicate key
+// (including a name written again through a Unicode escape), or an entry that
+// fails the key-matches-name / legal-name / digest / non-negative-size rules
+// must reject the whole operation. The error names the snapshot being created
+// and says the current index is corrupt (with the duplicated key or offending
+// artifact in the underlying reason), no snapshot is left behind, and the
+// index bytes, existing snapshots, and objects are untouched.
+func TestCreateSnapshotRejectsUnusableCurrentIndex(t *testing.T) {
+	goodDigest := hex.EncodeToString(sha256.New().Sum(nil))
+	validEntry := `{"name":"a","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}`
+	// A JSON key naming a/b directly and the same key written with a Unicode
+	// escape (/) must collide once the strings are decoded.
+	unicodeDupIndex := `{"entries":{` +
+		`"a/b":{"name":"a/b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"},` +
+		`"a` + `\` + `u002fb":{"name":"a/b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}` +
+		`}}`
+	cases := map[string]struct {
+		index       string
+		wantInError string
+	}{
+		"bare null": {
+			index:       `null`,
+			wantInError: "expected a JSON object with an entries mapping",
+		},
+		"empty object": {
+			index:       `{}`,
+			wantInError: "missing entries mapping",
+		},
+		"null entries": {
+			index:       `{"entries":null}`,
+			wantInError: "missing entries mapping",
+		},
+		"array entries": {
+			index:       `{"entries":[]}`,
+			wantInError: "cannot unmarshal",
+		},
+		"string entries": {
+			index:       `{"entries":"none"}`,
+			wantInError: "cannot unmarshal",
+		},
+		"number entries": {
+			index:       `{"entries":3}`,
+			wantInError: "cannot unmarshal",
+		},
+		"truncated document": {
+			index:       `{"entries":{`,
+			wantInError: "unexpected end of JSON input",
+		},
+		"trailing content": {
+			index:       `{"entries":{}} {}`,
+			wantInError: "invalid character",
+		},
+		"top level array": {
+			index:       `[]`,
+			wantInError: "expected a JSON object with an entries mapping",
+		},
+		"duplicate entries field": {
+			index:       `{"entries":null,"entries":{}}`,
+			wantInError: `duplicate key "entries"`,
+		},
+		"duplicate artifact name": {
+			index:       `{"entries":{"a":` + validEntry + `,"a":` + validEntry + `}}`,
+			wantInError: `duplicate key "a"`,
+		},
+		"same name through unicode escape": {
+			index:       unicodeDupIndex,
+			wantInError: `duplicate key "a/b"`,
+		},
+		"duplicate field inside entry": {
+			index:       `{"entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":0,"size":1,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+			wantInError: `duplicate key "size"`,
+		},
+		"entry key mismatch": {
+			index:       `{"entries":{"a":{"name":"b","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+			wantInError: `is filed under`,
+		},
+		"entry illegal name": {
+			index:       `{"entries":{"../evil":{"name":"../evil","digest":"` + goodDigest + `","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+			wantInError: `invalid entry name`,
+		},
+		"entry bad digest": {
+			index:       `{"entries":{"a":{"name":"a","digest":"XYZ","size":0,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+			wantInError: "want 64 lowercase hex characters",
+		},
+		"entry negative size": {
+			index:       `{"entries":{"a":{"name":"a","digest":"` + goodDigest + `","size":-7,"createdAt":"2026-01-01T00:00:00Z"}}}`,
+			wantInError: "negative size",
+		},
+	}
+	for label, tc := range cases {
+		t.Run(label, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "vault")
+			store := New(root)
+			keepEntry, err := store.Put("keep.txt", writeFile(t, "keep me"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.CreateSnapshot("keep"); err != nil {
+				t.Fatal(err)
+			}
+			// An object referenced by nothing once the mapping is replaced.
+			stray := hex.EncodeToString(sha256.New().Sum([]byte("stray")))
+			if err := os.WriteFile(filepath.Join(root, "objects", stray), []byte("stray"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			indexPath := filepath.Join(root, "index.json")
+			if err := os.WriteFile(indexPath, []byte(tc.index), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			keepRecord, err := os.ReadFile(filepath.Join(root, "snapshots", "keep.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			snap, err := store.CreateSnapshot("snap")
+			if err == nil {
+				t.Fatal("expected create to be rejected")
+			}
+			if !reflect.DeepEqual(snap, Snapshot{}) {
+				t.Fatalf("failed create returned a usable snapshot: %+v", snap)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, `cannot create snapshot "snap"`) {
+				t.Fatalf("error %q does not name the snapshot being created", msg)
+			}
+			if !strings.Contains(msg, "current index") {
+				t.Fatalf("error %q does not identify the current index as the cause", msg)
+			}
+			if !strings.Contains(msg, tc.wantInError) {
+				t.Fatalf("error %q does not indicate %q", msg, tc.wantInError)
+			}
+
+			// No new snapshot; the existing one is byte-for-byte unchanged.
+			infos, err := New(root).ListSnapshots()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(infos) != 1 || infos[0].Name != "keep" {
+				t.Fatalf("failed create changed the snapshot set: %+v", infos)
+			}
+			gotRecord, err := os.ReadFile(filepath.Join(root, "snapshots", "keep.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotRecord, keepRecord) {
+				t.Fatal("existing snapshot record was rewritten")
+			}
+			// The corrupt index bytes and every object are untouched.
+			gotIndex, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(gotIndex) != tc.index {
+				t.Fatalf("index was rewritten\nwas: %s\nnow: %s", tc.index, gotIndex)
+			}
+			for _, path := range []string{
+				filepath.Join(root, "objects", keepEntry.Digest),
+				filepath.Join(root, "objects", stray),
+			} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("object %s disappeared: %v", path, err)
+				}
+			}
+			// No temporary files left behind in the repository.
+			for _, dir := range []string{root, filepath.Join(root, "snapshots")} {
+				entries, err := os.ReadDir(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, e := range entries {
+					if strings.HasPrefix(e.Name(), ".snapshot-") || strings.HasPrefix(e.Name(), ".index-") {
+						t.Fatalf("temporary file left behind: %s", filepath.Join(dir, e.Name()))
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestCreateSnapshotErrorKindsStayDistinct makes sure an unusable current
+// index is never confused with the snapshot name being illegal or with a
+// snapshot of that name already existing.
+func TestCreateSnapshotErrorKindsStayDistinct(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	if _, err := store.Put("a.txt", writeFile(t, "data")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSnapshot("dup"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Healthy index: illegal name first, no index mention.
+	_, err := store.CreateSnapshot("../escape")
+	if err == nil || !strings.Contains(err.Error(), "name must be") || strings.Contains(err.Error(), "current index") {
+		t.Fatalf("illegal-name error wrong: %v", err)
+	}
+	// Healthy index: same-named snapshot, distinct from index corruption.
+	_, err = store.CreateSnapshot("dup")
+	if err == nil || !strings.Contains(err.Error(), `snapshot "dup" already exists`) || strings.Contains(err.Error(), "current index") {
+		t.Fatalf("duplicate-snapshot error wrong: %v", err)
+	}
+
+	// Corrupt index: the failure names the index, never "already exists"
+	// even when the snapshot name is free, and nothing is written.
+	if err := os.WriteFile(filepath.Join(root, "index.json"), []byte(`{"entries":null}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.CreateSnapshot("new-name")
+	if err == nil || !strings.Contains(err.Error(), `cannot create snapshot "new-name"`) ||
+		!strings.Contains(err.Error(), "missing entries mapping") {
+		t.Fatalf("corrupt-index error wrong: %v", err)
+	}
+}
+
+// TestCreateSnapshotReportsFirstBadEntryDeterministically verifies the whole
+// create is rejected (not filtered) when several entries are bad, and that the
+// artifact named in the error is the first in name order.
+func TestCreateSnapshotReportsFirstBadEntryDeterministically(t *testing.T) {
+	goodDigest := hex.EncodeToString(sha256.New().Sum(nil))
+	index := `{"entries":{` +
+		`"zeta":{"name":"zeta","digest":"nope","size":0,"createdAt":"2026-01-01T00:00:00Z"},` +
+		`"alpha":{"name":"alpha","digest":"` + goodDigest + `","size":-3,"createdAt":"2026-01-01T00:00:00Z"}` +
+		`}}`
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "index.json"), []byte(index), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.CreateSnapshot("snap")
+	if err == nil {
+		t.Fatal("expected create to fail")
+	}
+	if !strings.Contains(err.Error(), `entry "alpha"`) {
+		t.Fatalf("error %q does not name the alphabetically first bad entry alpha", err)
+	}
+}
+
+// TestCreateSnapshotEmptyEntriesIsValid confirms a genuine {"entries":{}}
+// mapping — unlike null or a missing entries field — is a healthy repository
+// whose snapshot creates, lists, and restores with zero entries.
+func TestCreateSnapshotEmptyEntriesIsValid(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	if err := store.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "index.json"),
+		[]byte("{\n  \"entries\": {}\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := store.CreateSnapshot("empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Entries) != 0 {
+		t.Fatalf("entries=%d", len(snap.Entries))
+	}
+	infos, err := New(root).ListSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 || infos[0].Name != "empty" || infos[0].Count != 0 {
+		t.Fatalf("infos=%+v", infos)
+	}
+	if err := New(root).RestoreSnapshot("empty"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCreateSnapshotPreservesAllMetadata verifies a created snapshot keeps
+// every name, digest, size, and creation time exactly — including when several
+// names share one digest, each keeps its own record.
+func TestCreateSnapshotPreservesAllMetadata(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	store := New(root)
+	same := writeFile(t, "identical bytes")
+	first, err := store.Put("releases/app.bin", same)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Put("mirror/app.bin", same)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.Put("docs/note.txt", writeFile(t, "different bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := store.CreateSnapshot("releases/stable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Entries) != 3 {
+		t.Fatalf("entries=%d", len(snap.Entries))
+	}
+	a := snap.Entries["releases/app.bin"]
+	b := snap.Entries["mirror/app.bin"]
+	if a.Digest != first.Digest || b.Digest != second.Digest || a.Digest != b.Digest {
+		t.Fatal("the two names sharing one object must both keep its digest")
+	}
+	if !a.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("first entry creation time not preserved: %v != %v", a.CreatedAt, first.CreatedAt)
+	}
+	if !b.CreatedAt.Equal(second.CreatedAt) {
+		t.Fatalf("second entry creation time not preserved: %v != %v", b.CreatedAt, second.CreatedAt)
+	}
+	if snap.Entries["docs/note.txt"].Digest != other.Digest {
+		t.Fatal("third entry digest not preserved")
+	}
+
+	// Mutate the live mapping, then restore: names, digests, sizes, and
+	// creation times must all come back from the snapshot record.
+	v2 := writeFile(t, "version two\n")
+	if _, err := store.Put("releases/app.bin", v2); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RestoreSnapshot("releases/stable"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Entry{}
+	for _, e := range entries {
+		got[e.Name] = e
+	}
+	if !reflect.DeepEqual(got, snap.Entries) {
+		t.Fatalf("restored mapping %+v != snapshot entries %+v", got, snap.Entries)
+	}
+}
+
 func writeSnapshotRecord(t *testing.T, root, name, record string) {
 	t.Helper()
 	path := filepath.Join(root, "snapshots", filepath.FromSlash(name)+".json")

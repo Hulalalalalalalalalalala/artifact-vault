@@ -29,6 +29,64 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(data)
 }
 
+// TestSnapshotCreateCLIRejectsCorruptIndex applies the same rules at the
+// command line as the Go API: a healthy create keeps its existing success
+// line, while an unusable current mapping fails with an error naming the
+// snapshot and the index, prints no success line, and leaves no snapshot.
+func TestSnapshotCreateCLIRejectsCorruptIndex(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	input := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(input, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", root, "--name", "a.txt", "--file", input}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := run([]string{"snapshot", "create", "--root", root, "--name", "good"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "snapshot good created with 1 entries") {
+		t.Fatalf("successful create must keep its existing success line, got %q", out)
+	}
+
+	// A null entries mapping is corruption, never an empty snapshot.
+	if err := os.WriteFile(filepath.Join(root, "index.json"),
+		[]byte(`{"entries":null}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var createErr error
+	out = captureStdout(t, func() {
+		createErr = run([]string{"snapshot", "create", "--root", root, "--name", "bad"})
+	})
+	if createErr == nil {
+		t.Fatal("expected create over a corrupt index to fail")
+	}
+	if !strings.Contains(createErr.Error(), `cannot create snapshot "bad"`) {
+		t.Fatalf("error %q does not name the snapshot being created", createErr)
+	}
+	if !strings.Contains(createErr.Error(), "missing entries mapping") {
+		t.Fatalf("error %q does not say why the index is unusable", createErr)
+	}
+	if out != "" {
+		t.Fatalf("failed create must print nothing, got %q", out)
+	}
+
+	listOut := captureStdout(t, func() {
+		if err := run([]string{"snapshot", "list", "--root", root}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(listOut, "good\t1\n") || strings.Contains(listOut, "bad") {
+		t.Fatalf("failed create left a snapshot behind: %q", listOut)
+	}
+}
+
 // TestSnapshotRestoreCLI confirms the command-line entry point follows the
 // same restore rules as the Go API: a damaged record fails (the caller exits
 // non-zero and no success line is printed), while a healthy record restores
