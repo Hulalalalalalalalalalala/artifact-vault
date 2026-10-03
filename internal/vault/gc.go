@@ -121,7 +121,7 @@ func (s *Store) gcLocked(dryRun bool) (GCReport, error) {
 // is an error: GC must never guess whether a reference exists.
 func (s *Store) collectReferences() (map[string]struct{}, error) {
 	referenced := map[string]struct{}{}
-	idx, err := s.loadStrict()
+	idx, err := s.loadCurrentIndex()
 	if err != nil {
 		return nil, fmt.Errorf("cannot collect references: current index is unusable: %w", err)
 	}
@@ -193,27 +193,6 @@ func (s *Store) collectReferences() (map[string]struct{}, error) {
 		return nil, err
 	}
 	return referenced, nil
-}
-
-// loadStrict reads the current index for GC. Unlike load it rejects a
-// missing or null entries mapping, since GC cannot distinguish "no entries"
-// from "references lost" in that case.
-func (s *Store) loadStrict() (index, error) {
-	data, err := os.ReadFile(s.indexPath())
-	if errors.Is(err, os.ErrNotExist) {
-		return index{}, fmt.Errorf("repository %q is not initialized: index.json is missing", s.root)
-	}
-	if err != nil {
-		return index{}, err
-	}
-	var idx index
-	if err := json.Unmarshal(data, &idx); err != nil {
-		return index{}, err
-	}
-	if idx.Entries == nil {
-		return index{}, errors.New("missing entries mapping")
-	}
-	return idx, nil
 }
 
 // validateEntryRecord checks one index or snapshot entry the same way

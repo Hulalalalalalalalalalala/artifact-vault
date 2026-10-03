@@ -138,9 +138,25 @@ func (s *Store) RestoreSnapshot(name string) error {
 				return fmt.Errorf("snapshot %q is corrupted: entry %q has negative size %d", name, entry.Name, entry.Size)
 			}
 		}
-		for _, entry := range snap.Entries {
-			if err := s.verifyObject(entry); err != nil {
-				return fmt.Errorf("cannot restore snapshot %q: object for %q: %w", name, entry.Name, err)
+		// Check each distinct referenced object once. A content digest fixes
+		// the byte count, so entries sharing a digest must also agree on size;
+		// sorted order keeps any failure deterministic.
+		for _, digest := range sortedDigests(snap.Entries) {
+			var representative Entry
+			size := int64(-1)
+			for _, entry := range snap.Entries {
+				if entry.Digest != digest {
+					continue
+				}
+				if size < 0 {
+					size, representative = entry.Size, entry
+				} else if entry.Size != size {
+					return fmt.Errorf("snapshot %q is corrupted: entry %q records %d bytes for digest %s, other entries record %d",
+						name, entry.Name, entry.Size, digest, size)
+				}
+			}
+			if err := s.verifyObject(representative); err != nil {
+				return fmt.Errorf("cannot restore snapshot %q: object for %q: %w", name, representative.Name, err)
 			}
 		}
 		return s.save(index{Entries: snap.Entries})

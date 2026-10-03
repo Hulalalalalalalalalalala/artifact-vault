@@ -51,7 +51,7 @@ func (s *Store) getLocked(name, output string) error {
 	// The index and every record it holds must be usable before any object is
 	// read. A missing or malformed record is reported as record corruption,
 	// distinct from a name that simply does not exist.
-	idx, err := s.loadStrict()
+	idx, err := s.loadCurrentIndex()
 	if err != nil {
 		return fmt.Errorf("artifact %q: record is corrupted: %w", name, err)
 	}

@@ -26,7 +26,14 @@ type index struct {
 	Entries map[string]Entry `json:"entries"`
 }
 
-type Store struct{ root string }
+type Store struct {
+	root string
+	// verifyHook, when set, runs while Verify holds the shared repository
+	// lock with the index already loaded and immediately before the first
+	// object is read. It exists for tests that must exercise the pass while
+	// it is in flight; Stores produced by New leave it nil.
+	verifyHook func()
+}
 
 func New(root string) *Store { return &Store{root: root} }
 
@@ -233,36 +240,136 @@ func (s *Store) List() ([]Entry, error) {
 	return entries, nil
 }
 
+// Verify checks every record in the current name mapping against the object
+// it references: the object must exist as a regular file whose actual size
+// and SHA-256 equal the recorded metadata. Only the current mapping is
+// checked; objects referenced solely by snapshots, and unreferenced objects,
+// never influence the result.
+//
+// The whole pass — from reading the mapping through the final object read —
+// runs under one shared repository lock (LOCK_SH), held continuously. Other
+// read-only operations (List, Get, and another Verify) take the same shared
+// lock and proceed concurrently, while every operation that could replace
+// the mapping or collect an object (Put, snapshot create/restore/import, and
+// GC) takes an exclusive lock and waits. A verify therefore always certifies
+// one complete, self-consistent state: it either fully observes a state
+// before a concurrent change or fully observes the state after it, and an
+// object the mapping it read still references cannot be garbage-collected
+// underneath it. This holds across separate processes that opened the same
+// repository, because the lock is an flock on <root>/.lock.
+//
+// Verify never modifies the mapping, any snapshot, or any object, and never
+// repairs damage: a missing object, a size or checksum mismatch, a
+// non-regular-file path, or a read failure is an error naming the artifact,
+// with a zero count. Lock release on return — including an error return —
+// lets pending changes proceed immediately.
 func (s *Store) Verify() (int, error) {
-	entries, err := s.List()
+	var n int
+	err := s.withLock(false, func() error {
+		idx, err := s.loadCurrentIndex()
+		if err != nil {
+			return err
+		}
+		// Validate every record before reading any object, so a corrupt
+		// mapping is reported as record corruption rather than as a missing
+		// object, and the count is always taken from one complete mapping.
+		for key, entry := range idx.Entries {
+			if err := validateEntryRecord(key, entry); err != nil {
+				return err
+			}
+		}
+		names := make([]string, 0, len(idx.Entries))
+		for name := range idx.Entries {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		if hook := s.verifyHook; hook != nil {
+			hook()
+		}
+		// Check each distinct referenced object once; two names sharing one
+		// digest still count as two records, but the object is read once.
+		checked := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			entry := idx.Entries[name]
+			if _, ok := checked[entry.Digest]; !ok {
+				if err := s.verifyObject(entry); err != nil {
+					return fmt.Errorf("verify %q: %w", name, err)
+				}
+				checked[entry.Digest] = struct{}{}
+			}
+		}
+		n = len(names)
+		return nil
+	})
 	if err != nil {
 		return 0, err
 	}
-	for _, entry := range entries {
-		if err := s.verifyObject(entry); err != nil {
-			return 0, fmt.Errorf("verify %q: %w", entry.Name, err)
-		}
-	}
-	return len(entries), nil
+	return n, nil
 }
 
-// verifyObject checks that the content object for entry exists and that its
-// actual size and SHA-256 match the recorded metadata.
+// verifyObject checks that the content object for entry exists as a regular
+// file — never a symlink (dangling or followed) or another special file —
+// and that its actual streamed size and SHA-256 equal the recorded size and
+// digest. The caller holds the repository lock, which keeps concurrent
+// writers and GC from replacing or collecting the object while it is read.
 func (s *Store) verifyObject(entry Entry) error {
-	file, err := os.Open(s.objectPath(entry.Digest))
+	path := s.objectPath(entry.Digest)
+	info, err := os.Lstat(path)
 	if err != nil {
-		return err
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("object %s is missing", entry.Digest)
+		}
+		return fmt.Errorf("cannot inspect object %s: %w", entry.Digest, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("object %s is a symbolic link", entry.Digest)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("object %s is not a regular file", entry.Digest)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("cannot read object %s: %w", entry.Digest, err)
 	}
 	hash := sha256.New()
 	size, copyErr := io.Copy(hash, file)
 	closeErr := file.Close()
-	if copyErr != nil || closeErr != nil {
-		return errors.New("read failed")
+	if copyErr != nil {
+		return fmt.Errorf("cannot read object %s: %w", entry.Digest, copyErr)
 	}
-	if size != entry.Size || hex.EncodeToString(hash.Sum(nil)) != entry.Digest {
-		return errors.New("content mismatch")
+	if closeErr != nil {
+		return fmt.Errorf("cannot read object %s: %w", entry.Digest, closeErr)
+	}
+	if size != entry.Size {
+		return fmt.Errorf("object %s is corrupted: content is %d bytes, record says %d", entry.Digest, size, entry.Size)
+	}
+	if actual := hex.EncodeToString(hash.Sum(nil)); actual != entry.Digest {
+		return fmt.Errorf("object %s is corrupted: content checksum is %s, want %s", entry.Digest, actual, entry.Digest)
 	}
 	return nil
+}
+
+// loadCurrentIndex reads the index for an operation that certifies the
+// current mapping: the file must exist, parse, and carry a non-null entries
+// mapping. A missing index means the repository was never initialized; a
+// null mapping cannot be distinguished from lost references. This is the
+// strict reader shared by Verify, Get, and GC.
+func (s *Store) loadCurrentIndex() (index, error) {
+	data, err := os.ReadFile(s.indexPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return index{}, fmt.Errorf("repository %q is not initialized: index.json is missing", s.root)
+	}
+	if err != nil {
+		return index{}, err
+	}
+	var idx index
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return index{}, err
+	}
+	if idx.Entries == nil {
+		return index{}, errors.New("missing entries mapping")
+	}
+	return idx, nil
 }
 
 func (s *Store) load() (index, error) {
