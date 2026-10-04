@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -59,6 +60,133 @@ func assertEntriesAfterRestore(t *testing.T, root, snap string, want map[string]
 		}
 		if d != digestOf(content) {
 			t.Fatalf("restore %s: entry %q digest %s, want %s", snap, name, d, digestOf(content))
+		}
+	}
+}
+
+// referencePackage builds the in-memory representation the pre-streaming
+// exporter assembled and returns its reference serialization.
+func referencePackage(t *testing.T, root, name, base string) []byte {
+	t.Helper()
+	store := New(root)
+	target, err := store.loadSnapshotRecord(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := &Package{Format: packageFormat, Version: packageVersion, Snapshot: target, Objects: []PackageObject{}}
+	carry := digestsReferenced(target.Entries)
+	if base != "" {
+		baseSnap, err := store.loadSnapshotRecord(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pkg.Base = &baseSnap
+		for digest := range digestsReferenced(baseSnap.Entries) {
+			delete(carry, digest)
+		}
+	}
+	for _, digest := range sortedDigests(target.Entries) {
+		content, size, err := store.readVerifiedObject(digest, target.Entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := carry[digest]; !ok {
+			continue
+		}
+		pkg.Objects = append(pkg.Objects, PackageObject{
+			Digest: digest,
+			Size:   size,
+			Data:   base64.StdEncoding.EncodeToString(content),
+		})
+	}
+	data, err := marshalPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// TestExportStreamedPackageMatchesReferenceFormat pins the streaming exporter
+// to the exact bytes the in-memory format produced: same version, fields,
+// indentation, and content encoding.
+func TestExportStreamedPackageMatchesReferenceFormat(t *testing.T) {
+	src, _ := seedVault(t, map[string]string{
+		"releases/app.txt": "version one\n",
+		"docs/readme.txt":  "version one\n", // same digest, carried once
+		"empty.txt":        "",
+		"big.bin":          strings.Repeat("xy", 1<<20),
+	})
+	if _, err := New(src).CreateSnapshot("base"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(src).Put("new.txt", writeFile(t, "added later")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(src).CreateSnapshot("target"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, base string }{
+		{"base", ""},       // full export
+		{"target", ""},     // full export, several objects
+		{"target", "base"}, // delta carrying one object
+		{"base", "base"},   // delta carrying no objects
+	} {
+		out := filepath.Join(t.TempDir(), "pkg")
+		if _, err := New(src).ExportSnapshot(tc.name, tc.base, out); err != nil {
+			t.Fatalf("export %s base %q: %v", tc.name, tc.base, err)
+		}
+		got, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := referencePackage(t, src, tc.name, tc.base); !bytes.Equal(got, want) {
+			t.Fatalf("export %s base %q: streamed package differs from the reference format\ngot:\n%s\nwant:\n%s", tc.name, tc.base, got, want)
+		}
+	}
+}
+
+// TestExportFailsWholeRunWhenLaterObjectCorrupt corrupts the object whose
+// digest sorts last, so healthy objects are fully processed first; the export
+// must still fail as a whole, name the corrupt object, and leave neither an
+// output nor a temporary file in the output directory.
+func TestExportFailsWholeRunWhenLaterObjectCorrupt(t *testing.T) {
+	src, _ := seedVault(t, map[string]string{
+		"a.txt": "alpha",
+		"z.txt": "zulu",
+	})
+	if _, err := New(src).CreateSnapshot("s"); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := digestOf("alpha")
+	if other := digestOf("zulu"); other > corrupt {
+		corrupt = other
+	}
+	obj := filepath.Join(src, "objects", corrupt)
+	good, err := os.ReadFile(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(obj, []byte("X"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.WriteFile(obj, good, 0o644) })
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "s.pkg")
+	if _, err := New(src).ExportSnapshot("s", "", out); err == nil ||
+		!strings.Contains(err.Error(), corrupt) {
+		t.Fatalf("expected failure naming object %s, got %v", corrupt, err)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatal("failed export created an output")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".package-") {
+			t.Fatalf("failed export left temporary file %s", e.Name())
 		}
 	}
 }

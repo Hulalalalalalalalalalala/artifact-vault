@@ -1,11 +1,14 @@
 package vault
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -47,9 +50,11 @@ type ImportResult struct {
 // is committed through a descriptor pinned to the resolved parent directory,
 // so a parent swapped for a symlink into the repository while the export runs
 // is detected at commit time and can never redirect the package onto a
-// repository file. The package is assembled in memory and written to a
-// temporary file in that directory before an atomic rename: a failed export
-// never creates or alters the output file.
+// repository file. The package is streamed to a temporary file in that
+// directory — each object's bytes are read, verified, and encoded in chunks,
+// never held in memory — before an atomic rename: a failed export never
+// creates or alters the output file, and the extra memory an export needs
+// does not grow with any object's size or the total carried bytes.
 func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) {
 	if err := validateName(name); err != nil {
 		return ExportResult{}, err
@@ -99,20 +104,13 @@ func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) 
 		if err != nil {
 			return err
 		}
-		pkg := &Package{
-			Format:   packageFormat,
-			Version:  packageVersion,
-			Snapshot: target,
-			Objects:  []PackageObject{},
-		}
-		var baseSnap Snapshot
+		var baseSnap *Snapshot
 		if base != "" {
-			var err error
-			baseSnap, err = s.loadSnapshotRecord(base)
+			loaded, err := s.loadSnapshotRecord(base)
 			if err != nil {
 				return fmt.Errorf("cannot use base snapshot: %w", err)
 			}
-			pkg.Base = &baseSnap
+			baseSnap = &loaded
 		}
 
 		// Verify every object the target references, reading each once. This
@@ -122,34 +120,16 @@ func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) 
 		// sorted order so the package layout and any failure message are
 		// deterministic.
 		carry := digestsReferenced(target.Entries)
-		if base != "" {
+		if baseSnap != nil {
 			for digest := range digestsReferenced(baseSnap.Entries) {
 				delete(carry, digest)
 			}
 		}
-		for _, digest := range sortedDigests(target.Entries) {
-			content, size, err := s.readVerifiedObject(digest, target.Entries)
-			if err != nil {
-				return fmt.Errorf("snapshot %q references unusable object %s: %w", name, digest, err)
-			}
-			if _, included := carry[digest]; !included {
-				continue
-			}
-			pkg.Objects = append(pkg.Objects, PackageObject{
-				Digest: digest,
-				Size:   size,
-				Data:   base64.StdEncoding.EncodeToString(content),
-			})
-		}
-
-		data, err := marshalPackage(pkg)
+		objects, err := s.writePackage(pin, absOut, mode, name, target, baseSnap, carry)
 		if err != nil {
 			return err
 		}
-		if err := s.writeOutputPackage(pin, absOut, data, mode); err != nil {
-			return err
-		}
-		result = ExportResult{Name: name, Entries: len(target.Entries), Objects: len(pkg.Objects)}
+		result = ExportResult{Name: name, Entries: len(target.Entries), Objects: objects}
 		return nil
 	})
 	if err != nil {
@@ -158,15 +138,17 @@ func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) 
 	return result, nil
 }
 
-// writeOutputPackage stages the package as a complete temporary file inside
-// the pinned parent directory and commits it via Store.commitOutput, which
-// revalidates the destination immediately before the atomic rename. On any
-// failure the temporary file is removed and an existing output is never
-// touched.
-func (s *Store) writeOutputPackage(pin *parentPin, absOut string, data []byte, mode os.FileMode) error {
+// writePackage stages the snapshot package as a complete temporary file
+// inside the pinned parent directory and commits it via Store.commitOutput,
+// which revalidates the destination immediately before the atomic rename. The
+// document is streamed to the temporary file while each referenced object is
+// verified, so neither object content nor the package text is ever held in
+// memory. On any failure the temporary file is removed and an existing output
+// is never touched. It returns the number of carried objects.
+func (s *Store) writePackage(pin *parentPin, absOut string, mode os.FileMode, name string, target Snapshot, base *Snapshot, carry map[string]struct{}) (int, error) {
 	tmp, tmpBase, err := createTempIn(pin, ".package-")
 	if err != nil {
-		return fmt.Errorf("cannot create temporary file for output: %w", err)
+		return 0, fmt.Errorf("cannot create temporary file for output: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -176,25 +158,205 @@ func (s *Store) writeOutputPackage(pin *parentPin, absOut string, data []byte, m
 	}()
 	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
-		return fmt.Errorf("cannot prepare output file: %w", err)
+		return 0, fmt.Errorf("cannot prepare output file: %w", err)
 	}
-	if _, err := tmp.Write(data); err != nil {
+	objects, err := s.streamPackage(tmp, absOut, name, target, base, carry)
+	if err != nil {
 		tmp.Close()
-		return fmt.Errorf("cannot write output %q: %w", absOut, err)
+		return 0, err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return fmt.Errorf("cannot write output %q: %w", absOut, err)
+		return 0, fmt.Errorf("cannot write output %q: %w", absOut, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("cannot write output %q: %w", absOut, err)
+		return 0, fmt.Errorf("cannot write output %q: %w", absOut, err)
 	}
 	if err := s.commitOutput(pin, tmpBase, absOut); err != nil {
-		return err
+		return 0, err
 	}
 	committed = true
 	_ = syncDirectory(pin.f)
-	return nil
+	return objects, nil
+}
+
+// streamPackage writes the snapshot package to out as one indented JSON
+// document, byte-identical to marshalPackage over the equivalent in-memory
+// representation, while reading every referenced object exactly once in
+// chunks. Objects in the carry set are base64-encoded into the document as
+// they are verified; objects the delta omits are verified with the same
+// strictness without being written. Content is never buffered, so memory use
+// stays independent of object and package size. It returns the number of
+// carried objects.
+func (s *Store) streamPackage(out *os.File, absOut, name string, target Snapshot, base *Snapshot, carry map[string]struct{}) (int, error) {
+	snapshotJSON, err := json.MarshalIndent(target, "  ", "  ")
+	if err != nil {
+		return 0, err
+	}
+	var baseJSON []byte
+	if base != nil {
+		baseJSON, err = json.MarshalIndent(*base, "  ", "  ")
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	w := bufio.NewWriter(out)
+	ew := &errWriter{w: w}
+	ew.writeString("{\n  \"format\": ")
+	ew.writeString(jsonString(packageFormat))
+	fmt.Fprintf(ew, ",\n  \"version\": %d,\n  \"snapshot\": ", packageVersion)
+	ew.Write(snapshotJSON)
+	if base != nil {
+		ew.writeString(",\n  \"base\": ")
+		ew.Write(baseJSON)
+	}
+	ew.writeString(",\n  \"objects\": [")
+
+	objects := 0
+	for _, digest := range sortedDigests(target.Entries) {
+		if _, carried := carry[digest]; !carried {
+			// Omitted from a delta package: verified in full, not carried.
+			if _, err := s.streamVerifiedObject(digest, target.Entries, nil); err != nil {
+				return 0, fmt.Errorf("snapshot %q references unusable object %s: %w", name, digest, err)
+			}
+			continue
+		}
+		if ew.err != nil {
+			return 0, fmt.Errorf("cannot write output %q: %w", absOut, ew.err)
+		}
+		if objects > 0 {
+			ew.writeString(",")
+		}
+		// The size field precedes the data, so the recorded size is written
+		// before the content is measured; streamVerifiedObject then confirms
+		// the actual byte count against every referencing record before
+		// anything is committed, so a lying record still fails the export.
+		fmt.Fprintf(ew, "\n    {\n      \"digest\": \"%s\",\n      \"size\": %d,\n      \"data\": \"",
+			digest, recordedSize(target.Entries, digest))
+		enc := base64.NewEncoder(base64.StdEncoding, ew)
+		_, verr := s.streamVerifiedObject(digest, target.Entries, enc)
+		cerr := enc.Close()
+		if ew.err != nil {
+			return 0, fmt.Errorf("cannot write output %q: %w", absOut, ew.err)
+		}
+		if verr != nil {
+			return 0, fmt.Errorf("snapshot %q references unusable object %s: %w", name, digest, verr)
+		}
+		if cerr != nil {
+			return 0, fmt.Errorf("cannot write output %q: %w", absOut, cerr)
+		}
+		ew.writeString("\"\n    }")
+		objects++
+	}
+	if objects > 0 {
+		ew.writeString("\n  ")
+	}
+	ew.writeString("]\n}\n")
+	if ew.err != nil {
+		return 0, fmt.Errorf("cannot write output %q: %w", absOut, ew.err)
+	}
+	if err := w.Flush(); err != nil {
+		return 0, fmt.Errorf("cannot write output %q: %w", absOut, err)
+	}
+	return objects, nil
+}
+
+// errWriter records the first write error so the streaming writer can report
+// an output failure instead of mistaking it for object corruption.
+type errWriter struct {
+	w   *bufio.Writer
+	err error
+}
+
+func (ew *errWriter) Write(p []byte) (int, error) {
+	if ew.err != nil {
+		return 0, ew.err
+	}
+	n, err := ew.w.Write(p)
+	if err != nil {
+		ew.err = err
+	}
+	return n, err
+}
+
+func (ew *errWriter) writeString(s string) {
+	if ew.err != nil {
+		return
+	}
+	if _, err := ew.w.WriteString(s); err != nil {
+		ew.err = err
+	}
+}
+
+// jsonString renders s as a JSON string literal exactly as encoding/json
+// does, so hand-written fragments match the marshaled parts of the document.
+func jsonString(s string) string {
+	data, err := json.Marshal(s)
+	if err != nil {
+		panic(err) // a string always marshals
+	}
+	return string(data)
+}
+
+// recordedSize returns the size any entry referencing digest records for it.
+// Carried digests are always referenced, and streamVerifiedObject confirms
+// the recorded size against the actual byte count before the export commits.
+func recordedSize(entries map[string]Entry, digest string) int64 {
+	for _, entry := range entries {
+		if entry.Digest == digest {
+			return entry.Size
+		}
+	}
+	return 0
+}
+
+// streamVerifiedObject reads the content object filed under digest in chunks,
+// requiring it to be a regular file (never a symlink or other special file)
+// whose actual byte count and SHA-256 match digest and the size every
+// referencing entry records for it. When sink is non-nil the bytes are
+// written to sink as they are read; either way content is never held in
+// memory. It returns the true byte count.
+func (s *Store) streamVerifiedObject(digest string, entries map[string]Entry, sink io.Writer) (int64, error) {
+	path := s.objectPath(digest)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return 0, errors.New("object path is a symbolic link")
+	}
+	if !info.Mode().IsRegular() {
+		return 0, errors.New("object path is not a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	hash := sha256.New()
+	var w io.Writer = hash
+	if sink != nil {
+		w = io.MultiWriter(hash, sink)
+	}
+	size, copyErr := io.Copy(w, file)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return 0, copyErr
+	}
+	if closeErr != nil {
+		return 0, closeErr
+	}
+	if actual := hex.EncodeToString(hash.Sum(nil)); actual != digest {
+		return 0, fmt.Errorf("content checksum is %s", actual)
+	}
+	// Every entry referencing this digest must agree on the size; a content
+	// hash fixes the byte count, so a disagreement is a corrupt record.
+	for _, entry := range entries {
+		if entry.Digest == digest && size != entry.Size {
+			return 0, fmt.Errorf("content is %d bytes, record for %q says %d", size, entry.Name, entry.Size)
+		}
+	}
+	return size, nil
 }
 
 // ImportSnapshot imports a snapshot package produced by ExportSnapshot into an

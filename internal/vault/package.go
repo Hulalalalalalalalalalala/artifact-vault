@@ -116,7 +116,9 @@ func rejectDuplicateKeys(data []byte) error {
 	}
 }
 
-// marshalPackage serializes the package as indented JSON.
+// marshalPackage serializes the package as indented JSON. Export no longer
+// assembles packages in memory — it streams the same document — so this is
+// the reference serialization tests compare the streamed output against.
 func marshalPackage(pkg *Package) ([]byte, error) {
 	data, err := json.MarshalIndent(pkg, "", "  ")
 	if err != nil {
