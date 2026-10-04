@@ -192,7 +192,7 @@ func TestIncrementalExportImport(t *testing.T) {
 	if _, err := New(src).Put("new.txt", writeFile(t, "brand new")); err != nil {
 		t.Fatal(err)
 	}
-	idx, err := srcStore.load()
+	idx, err := srcStore.loadStrict()
 	if err != nil {
 		t.Fatal(err)
 	}

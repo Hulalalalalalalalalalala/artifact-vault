@@ -272,15 +272,44 @@ func (s *Store) loadIndexForUpload(uploadName string) (index, error) {
 	return idx, nil
 }
 
+// List returns the artifacts of the current name mapping sorted by full
+// artifact name. The mapping is accepted only under the same strict rules
+// uploads, verify, and snapshot creation enforce: the index must be one
+// complete JSON object with an explicitly present entries mapping (a genuine
+// {"entries":{}} is a legitimate empty repository; a bare null, a missing or
+// null entries mapping, a non-object mapping, truncated input or trailing
+// content, and any duplicate key at any level — including a name written
+// directly and again through Unicode escapes — is corruption), and every
+// record must be keyed by its recorded name with a legal name, a
+// 64-character lowercase-hex digest, and a non-negative size. A single bad
+// record fails the whole listing: no partial list is returned and no record
+// is skipped. A missing index is reported as an uninitialized repository,
+// and an index whose bytes cannot be read is reported distinctly from one
+// whose contents are corrupt. List only reads the current mapping — it never
+// opens content objects or snapshots, so missing or damaged objects and
+// damaged snapshots do not affect it — and it never rewrites the index,
+// snapshots, or objects.
 func (s *Store) List() ([]Entry, error) {
 	var entries []Entry
 	err := s.withLock(false, func() error {
-		idx, err := s.load()
+		idx, err := s.loadStrict()
 		if err != nil {
 			return err
 		}
+		// Validate in sorted key order so the first bad record reported is
+		// deterministic; since a valid record's key equals its name, the
+		// resulting list is already sorted by full artifact name.
+		keys := make([]string, 0, len(idx.Entries))
+		for key := range idx.Entries {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
 		entries = make([]Entry, 0, len(idx.Entries))
-		for _, entry := range idx.Entries {
+		for _, key := range keys {
+			entry := idx.Entries[key]
+			if err := validateEntryRecord(key, entry); err != nil {
+				return fmt.Errorf("current index is corrupt: %w", err)
+			}
 			entries = append(entries, entry)
 		}
 		return nil
@@ -288,7 +317,6 @@ func (s *Store) List() ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return entries, nil
 }
 
@@ -364,21 +392,6 @@ func (s *Store) verifyObject(entry Entry) error {
 		return errors.New("content mismatch")
 	}
 	return nil
-}
-
-func (s *Store) load() (index, error) {
-	data, err := os.ReadFile(s.indexPath())
-	if err != nil {
-		return index{}, err
-	}
-	var idx index
-	if err := json.Unmarshal(data, &idx); err != nil {
-		return index{}, err
-	}
-	if idx.Entries == nil {
-		idx.Entries = map[string]Entry{}
-	}
-	return idx, nil
 }
 
 func (s *Store) save(idx index) error {
