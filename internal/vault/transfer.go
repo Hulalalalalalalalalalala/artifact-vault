@@ -209,6 +209,17 @@ func (s *Store) writeOutputPackage(pin *parentPin, absOut string, data []byte, m
 // present with identical metadata succeeds without creating a second copy. A
 // same-named snapshot with different metadata is refused.
 //
+// Every record in the target snapshot must state the exact byte count of the
+// content it references — checked against the carried content and, for
+// objects a delta omits, against the healthy destination object — under each
+// referencing name: one content shared by several entries must satisfy every
+// record individually. A single mismatch rejects the whole package; the bad
+// size is never rewritten, the entry never skipped, and no other correct
+// object from the package is left staged. The failure names the target
+// snapshot, the artifact, the content digest, the recorded size, and the
+// actual byte count so record corruption is distinguishable from a content
+// checksum failure.
+//
 // All validation and reuse happens before anything is written. New objects
 // land as complete files via temp-file-and-rename, and the snapshot record is
 // renamed into place only after every object the mapping references has been
@@ -281,15 +292,9 @@ func (s *Store) ImportSnapshot(file string) (ImportResult, error) {
 				return fmt.Errorf("snapshot %q already exists with different metadata; refusing to overwrite", pkg.Snapshot.Name)
 			}
 			identicalSnapshot = true
-			// Fast path: everything the published snapshot needs is already
-			// present and healthy, so the import is a no-op.
-			if s.verifyReferencedObjects(pkg.Snapshot.Name, pkg.Snapshot.Entries) == nil {
-				result = ImportResult{Name: pkg.Snapshot.Name, Entries: len(pkg.Snapshot.Entries), NewObjects: 0}
-				return nil
-			}
-			// Otherwise fall through: a carried object that is merely missing
-			// can be staged to complete an earlier interrupted import, while a
-			// damaged existing object still aborts below.
+			// An identical record may still need carried objects staged to
+			// complete an earlier interrupted import; fall through to the
+			// write-free validation below instead of committing early.
 		} else if !errors.Is(statErr, os.ErrNotExist) {
 			return statErr
 		}
@@ -299,11 +304,20 @@ func (s *Store) ImportSnapshot(file string) (ImportResult, error) {
 			return err
 		}
 
-		// Phase 1, no writes: classify every carried object. Existing files
-		// must be healthy and are reused; a damaged one aborts the import and
-		// is reported by digest.
+		// Phase 1, no writes: establish the actual byte count of every distinct
+		// digest the target references and classify every carried object.
+		// Existing files must be healthy regular files and are reused; a
+		// damaged one aborts the import and is reported by digest. Nothing is
+		// staged in this phase, so a record/content size disagreement below can
+		// never leave even one new object behind.
+		actualSize := make(map[string]int64, len(objects))
+		carried := make(map[string]struct{}, len(objects))
 		toAdd := make([]objectContent, 0, len(objects))
 		for _, obj := range objects {
+			carried[obj.digest] = struct{}{}
+			// The package decoder already proved the carried bytes hash to the
+			// digest, so their length is the content's true byte count.
+			actualSize[obj.digest] = int64(len(obj.content))
 			path := s.objectPath(obj.digest)
 			info, err := os.Lstat(path)
 			switch {
@@ -314,7 +328,7 @@ func (s *Store) ImportSnapshot(file string) (ImportResult, error) {
 				if !info.Mode().IsRegular() {
 					return fmt.Errorf("object %s: object path is not a regular file", obj.digest)
 				}
-				if _, _, err := s.readVerifiedObject(obj.digest, pkg.Snapshot.Entries); err != nil {
+				if _, _, err := s.readHealthyObject(obj.digest); err != nil {
 					return fmt.Errorf("object %s already present but damaged: %w", obj.digest, err)
 				}
 			case errors.Is(err, os.ErrNotExist):
@@ -324,9 +338,34 @@ func (s *Store) ImportSnapshot(file string) (ImportResult, error) {
 			}
 		}
 
+		// Objects the delta omits live in the destination under the matching
+		// base verified above. Read each one to learn its true byte count and
+		// re-confirm its checksum; a missing or damaged object aborts before
+		// anything is staged. (A full package carries every referenced
+		// digest, so this loop is empty for it.)
+		for _, digest := range sortedDigests(pkg.Snapshot.Entries) {
+			if _, ok := carried[digest]; ok {
+				continue
+			}
+			_, size, err := s.readHealthyObject(digest)
+			if err != nil {
+				return fmt.Errorf("object %s needed by snapshot %q: %w", digest, pkg.Snapshot.Name, err)
+			}
+			actualSize[digest] = size
+		}
+
+		// The size rule gates every write: each target record's size must equal
+		// its content's actual byte count, under every referencing name. This
+		// is record corruption and is reported distinctly from a checksum
+		// failure above.
+		if err := checkEntrySizes(pkg.Snapshot.Name, pkg.Snapshot.Entries, actualSize); err != nil {
+			return err
+		}
+
 		// Phase 2: stage missing objects as complete, content-addressed files.
-		// A failure here leaves only unreferenced complete objects behind; a
-		// retry reuses them and finishes the import.
+		// All validation above was write-free, so reaching here means the
+		// whole package is acceptable; a failure in this phase leaves only
+		// unreferenced complete objects behind, and a retry reuses them.
 		for _, obj := range toAdd {
 			if err := s.stageObject(obj.digest, obj.content); err != nil {
 				return err
@@ -397,9 +436,13 @@ func (s *Store) verifyReferencedObjects(snapshotName string, entries map[string]
 	return nil
 }
 
-// readVerifiedObject reads a content object and returns its bytes, confirming
-// its SHA-256 digest and the size recorded for it in the given entries.
-func (s *Store) readVerifiedObject(digest string, entries map[string]Entry) ([]byte, int64, error) {
+// readHealthyObject reads a content object and returns its bytes, confirming
+// it is a regular file (never a symlink or other special file) whose SHA-256
+// matches the digest. It deliberately performs no record comparison: a digest
+// fixes the content but several snapshot records may quote a size for it, and
+// the per-entry size rule is enforced by the caller, which knows which
+// snapshot each record belongs to (see checkEntrySizes).
+func (s *Store) readHealthyObject(digest string) ([]byte, int64, error) {
 	path := s.objectPath(digest)
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -419,14 +462,51 @@ func (s *Store) readVerifiedObject(digest string, entries map[string]Entry) ([]b
 	if actual := hex.EncodeToString(sum[:]); actual != digest {
 		return nil, 0, fmt.Errorf("content checksum is %s", actual)
 	}
+	return content, int64(len(content)), nil
+}
+
+// readVerifiedObject reads a content object and returns its bytes, confirming
+// its SHA-256 digest and the size recorded for it in the given entries.
+func (s *Store) readVerifiedObject(digest string, entries map[string]Entry) ([]byte, int64, error) {
+	content, size, err := s.readHealthyObject(digest)
+	if err != nil {
+		return nil, 0, err
+	}
 	// Every entry referencing this digest must agree on the size; a content
 	// hash fixes the byte count, so a disagreement is a corrupt record.
 	for _, entry := range entries {
-		if entry.Digest == digest && int64(len(content)) != entry.Size {
-			return nil, 0, fmt.Errorf("content is %d bytes, record for %q says %d", len(content), entry.Name, entry.Size)
+		if entry.Digest == digest && size != entry.Size {
+			return nil, 0, fmt.Errorf("content is %d bytes, record for %q says %d", size, entry.Name, entry.Size)
 		}
 	}
-	return content, int64(len(content)), nil
+	return content, size, nil
+}
+
+// checkEntrySizes proves every target entry records the exact byte count of
+// the content it references, under every referencing name (one digest may
+// back several entries). actualSize holds the real byte length of every
+// distinct digest the target names: carried content is measured straight
+// from the package, whose per-object checksum was verified at decode, and
+// anything omitted by a delta is read from the destination after the
+// matching base snapshot proved those objects healthy.
+//
+// A disagreement is a corrupt record, never content damage, so the error
+// names the target snapshot, the artifact, the content digest, the recorded
+// size, and the actual byte count — distinct from a checksum failure.
+func checkEntrySizes(snapshotName string, entries map[string]Entry, actualSize map[string]int64) error {
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		entry := entries[name]
+		if actual := actualSize[entry.Digest]; entry.Size != actual {
+			return fmt.Errorf("snapshot %q record for %q is corrupt: content object %s is %d bytes, but the record says %d",
+				snapshotName, entry.Name, entry.Digest, actual, entry.Size)
+		}
+	}
+	return nil
 }
 
 // stageObject writes one missing object to a temp file and renames it into

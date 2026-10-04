@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -313,6 +314,144 @@ func TestSnapshotListCLIAtomicOnCorruption(t *testing.T) {
 	if out != "" {
 		t.Fatalf("fresh repository listed output: %q", out)
 	}
+}
+
+// TestSnapshotImportCLIRejectsRecordSizeMismatch drives the real export ->
+// tamper -> import path at the command line: the carried content is intact,
+// only the target record lies about its size. Import must fail non-zero,
+// print no success line, and leave neither the target snapshot nor any
+// unreferenced content object in the destination.
+func TestSnapshotImportCLIRejectsRecordSizeMismatch(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "vault")
+	if err := run([]string{"init", "--root", src}); err != nil {
+		t.Fatal(err)
+	}
+	badInput := filepath.Join(t.TempDir(), "bad.txt")
+	goodInput := filepath.Join(t.TempDir(), "good.txt")
+	if err := os.WriteFile(badInput, []byte("payload"), 0o644); err != nil { // 7 bytes
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goodInput, []byte("other"), 0o644); err != nil { // 5 bytes
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", src, "--name", "bad.txt", "--file", badInput}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", src, "--name", "good.txt", "--file", goodInput}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"snapshot", "create", "--root", src, "--name", "s"}); err != nil {
+		t.Fatal(err)
+	}
+	pkgPath := filepath.Join(t.TempDir(), "s.pkg")
+	if err := run([]string{"snapshot", "export", "--root", src, "--name", "s", "--output", pkgPath}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt only the target record's size: 7 real bytes, 8 recorded. The
+	// package bytes and object payload stay intact, so the failure is purely a
+	// corrupt record.
+	raw, err := os.ReadFile(pkgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	entries := doc["snapshot"].(map[string]any)["entries"].(map[string]any)
+	badEntry := entries["bad.txt"].(map[string]any)
+	badDigest := badEntry["digest"].(string)
+	if badEntry["size"].(float64) != 7 {
+		t.Fatalf("test setup: expected 7 recorded bytes, got %v", badEntry["size"])
+	}
+	badEntry["size"] = 8
+	tampered, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pkgPath, tampered, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "vault")
+	if err := run([]string{"init", "--root", dst}); err != nil {
+		t.Fatal(err)
+	}
+	objectsBefore := listRegularNames(t, filepath.Join(dst, "objects"))
+
+	var importErr error
+	out := captureStdout(t, func() {
+		importErr = run([]string{"snapshot", "import", "--root", dst, "--file", pkgPath})
+	})
+	if importErr == nil {
+		t.Fatal("CLI import of a size-lying record succeeded")
+	}
+	msg := importErr.Error()
+	for _, want := range []string{`snapshot "s"`, "bad.txt", badDigest, "is 7 bytes", "record says 8"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("CLI error %q missing %q", msg, want)
+		}
+	}
+	if strings.Contains(out, "imported snapshot") {
+		t.Fatalf("failed CLI import printed a success line: %q", out)
+	}
+	// No target snapshot, no leftover objects or temporary files.
+	listOut := captureStdout(t, func() {
+		if err := run([]string{"snapshot", "list", "--root", dst}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if listOut != "" {
+		t.Fatalf("failed import published a snapshot: %q", listOut)
+	}
+	if got := listRegularNames(t, filepath.Join(dst, "objects")); len(got) != len(objectsBefore) {
+		t.Fatalf("failed import left objects: before=%v after=%v", objectsBefore, got)
+	}
+	for _, name := range walkRegularNames(t, dst) {
+		if strings.HasPrefix(name, ".import-") || strings.HasPrefix(name, ".snapshot-") {
+			t.Fatalf("failed import left a temporary file: %s", name)
+		}
+	}
+}
+
+// listRegularNames returns the regular-file names directly inside dir (or an
+// empty slice when it does not exist).
+func listRegularNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{}
+	for _, e := range entries {
+		if e.Type().IsRegular() {
+			names = append(names, e.Name())
+		}
+	}
+	return names
+}
+
+// walkRegularNames returns the base names of every regular file beneath root.
+func walkRegularNames(t *testing.T, root string) []string {
+	t.Helper()
+	names := []string{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			names = append(names, info.Name())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return names
 }
 
 // TestSnapshotRestoreCLIMissingName fails without a success line when the

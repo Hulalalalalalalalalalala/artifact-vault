@@ -138,6 +138,12 @@ func marshalPackage(pkg *Package) ([]byte, error) {
 //     mapping minus the base mapping (all of them for a full package),
 //     neither omitting a referenced digest nor carrying an unreferenced one.
 //
+// A target entry's recorded size is deliberately not cross-checked against
+// carried content here: an incremental package omits most of the objects its
+// mapping references, so the actual byte count is only known where import has
+// the destination in hand. Import enforces the size rule for every entry
+// before writing anything (see Store.ImportSnapshot).
+//
 // Cross-repository checks (an existing base snapshot, objects already present
 // in the destination, name collisions) are performed later by import, which
 // has the destination in hand.
