@@ -96,3 +96,17 @@ Note: this output displays certificate information only; reading the file succes
 | 2 | 用法错误：缺少检查路径、参数多余、命令未知（同时打印用法说明） |
 
 失败时标准输出不会留下任何半截证书信息。
+
+## 回归测试
+
+构建后通过 CTest 运行（默认随构建启用）：
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+测试围绕 `inspect` 的实际行为组织：PEM/DER 成功读取与字段一致性、扩展名与内容不符、PEM 周边空白、过期与自签名证书照常显示，以及第二证书块、块外文字、DER 尾部多余字节、空文件、截断数据、仅含密钥等拒绝场景（退出码、标准输出全文、标准错误诊断逐一校验）。
+
+测试证书固定存放在 `tests/fixtures/` 并随仓库提交，有效期与序列号均为定值，不依赖联网或系统信任库。如需重新生成，可执行 `python3 tests/generate_fixtures.py`（会更换密钥，指纹预期值由测试脚本从 DER 文件实时推导，无需手工同步）。
