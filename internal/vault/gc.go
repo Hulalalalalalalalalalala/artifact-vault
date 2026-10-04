@@ -159,6 +159,17 @@ func (s *Store) collectReferences() (map[string]struct{}, error) {
 // records carried. Keys are compared after JSON string decoding, so a name
 // written directly and the same name written with Unicode escapes still
 // collide.
+//
+// The top-level entries field must be spelled exactly "entries". A field
+// that differs only by letter case ("Entries", "ENTRIES", ...) is corruption
+// whether it appears alone or next to the standard field, in either order
+// and with any content: encoding/json matches struct tags case-insensitively,
+// so such a field would silently populate the mapping or let a later empty
+// mapping overwrite the records under the standard field, and neither this
+// reader nor GC can tell which mapping is authoritative. Field names are
+// judged by the letters they decode to: a standard "entries" written through
+// Unicode escapes is the real field, while escapes decoding to a case
+// variant are rejected. Unrelated extra top-level fields are still ignored.
 func (s *Store) loadStrict() (index, error) {
 	data, err := os.ReadFile(s.indexPath())
 	if errors.Is(err, os.ErrNotExist) {
@@ -178,6 +189,9 @@ func (s *Store) loadStrict() (index, error) {
 	if trimmed := bytes.TrimSpace(data); len(trimmed) == 0 || trimmed[0] != '{' {
 		return index{}, errors.New("current index is corrupt: expected a JSON object with an entries mapping")
 	}
+	if err := rejectEntriesCaseVariants(data); err != nil {
+		return index{}, fmt.Errorf("current index is corrupt: %w", err)
+	}
 	var idx index
 	// json.Unmarshal rejects truncated input and trailing content after the
 	// top-level value.
@@ -190,12 +204,56 @@ func (s *Store) loadStrict() (index, error) {
 	return idx, nil
 }
 
+// rejectEntriesCaseVariants fails when the top-level object carries a field
+// whose name differs from "entries" only by letter case ("Entries",
+// "ENTRIES", ...). encoding/json matches the entries struct tag
+// case-insensitively, so such a field would otherwise be accepted as the
+// name mapping — or, appearing alongside the standard field, silently merge
+// with or overwrite it depending on order. Field names are compared after
+// JSON string decoding, so a name is judged by the letters it decodes to: an
+// escaped exact "entries" is the standard field, while escapes decoding to a
+// case variant are rejected. Only the top-level object is inspected; keys
+// inside the entries mapping are artifact names, which stay case-sensitive,
+// and unrelated extra top-level fields are ignored.
+//
+// A document too malformed to walk is not this check's problem: json.Unmarshal
+// rejects the same bytes with a more precise syntax error, so a token or
+// decode failure here simply defers to it.
+func rejectEntriesCaseVariants(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if _, err := dec.Token(); err != nil {
+		return nil
+	}
+	// The caller has already established the document is an object, so the
+	// opening token is '{' and each string token at this level is a key.
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return nil
+		}
+		if key != "entries" && strings.EqualFold(key, "entries") {
+			return fmt.Errorf("entries mapping must be spelled exactly %q, found %q", "entries", key)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil
+		}
+	}
+	return nil
+}
+
 // loadStrictValidEntries loads the current mapping under loadStrict and then
 // validates every record before returning it: the document must be one
-// complete JSON object with an explicitly present entries mapping (a true
-// {"entries":{}} is a legitimate empty repository), hold no duplicate key at
-// any level (including a name written directly and again through Unicode
-// escapes), and every record must pass validateEntryRecord. Records are
+// complete JSON object with an explicitly present entries mapping spelled
+// exactly "entries" (a true {"entries":{}} is a legitimate empty repository;
+// a field differing only by letter case, such as "Entries", is corruption
+// whether it appears alone or beside the standard field), hold no duplicate
+// key at any level (including a name written directly and again through
+// Unicode escapes), and every record must pass validateEntryRecord. Records are
 // checked in sorted name order so the first bad record reported is
 // deterministic. One bad record fails the whole load; the caller never gets a
 // partial mapping. This is the single gate list, put, get, verify, gc, and

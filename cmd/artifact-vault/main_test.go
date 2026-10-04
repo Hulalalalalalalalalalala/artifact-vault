@@ -534,3 +534,123 @@ func TestSnapshotRestoreCLIMissingName(t *testing.T) {
 		t.Fatalf("missing-snapshot restore printed a success line: %q", out)
 	}
 }
+
+// TestCLICaseVariantEntriesField applies the exact-spelling rule at the
+// command line: an index whose top-level mapping field differs from
+// "entries" only by letter case is corruption for every dependent command —
+// no success line and no partial artifact rows are printed, and the index,
+// snapshots, and objects stay untouched — while a healthy snapshot still
+// restores over the corrupt index.
+func TestCLICaseVariantEntriesField(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+	input := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(input, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", root, "--name", "keep.txt", "--file", input}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"snapshot", "create", "--root", root, "--name", "snap"}); err != nil {
+		t.Fatal(err)
+	}
+
+	indexPath := filepath.Join(root, "index.json")
+	corrupt := []byte(`{"entries":{` +
+		`"keep.txt":{"name":"keep.txt","digest":"` + strings.Repeat("a", 64) + `","size":7,"createdAt":"2026-01-01T00:00:00Z"}` +
+		`},"Entries":{}}`)
+	if err := os.WriteFile(indexPath, corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// list: no rows, error naming the corrupt index and the offending field.
+	var listErr error
+	out := captureStdout(t, func() {
+		listErr = run([]string{"list", "--root", root})
+	})
+	if listErr == nil {
+		t.Fatal("expected list over a case-variant index to fail")
+	}
+	if !strings.Contains(listErr.Error(), "current index is corrupt") ||
+		!strings.Contains(listErr.Error(), `"Entries"`) {
+		t.Fatalf("error %q does not name the corrupt index and offending field", listErr)
+	}
+	if out != "" {
+		t.Fatalf("failed list printed artifact rows: %q", out)
+	}
+
+	// snapshot create: no success line, no new record.
+	var createErr error
+	out = captureStdout(t, func() {
+		createErr = run([]string{"snapshot", "create", "--root", root, "--name", "new"})
+	})
+	if createErr == nil {
+		t.Fatal("expected snapshot create over a case-variant index to fail")
+	}
+	if !strings.Contains(createErr.Error(), `cannot create snapshot "new"`) ||
+		!strings.Contains(createErr.Error(), "current index is corrupt") {
+		t.Fatalf("error %q does not name the snapshot and corrupt index", createErr)
+	}
+	if out != "" {
+		t.Fatalf("failed create printed a success line: %q", out)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "snapshots", "new.json")); !os.IsNotExist(err) {
+		t.Fatalf("failed create left a snapshot behind: %v", err)
+	}
+
+	// gc: no report, nothing deleted.
+	var gcErr error
+	out = captureStdout(t, func() {
+		gcErr = run([]string{"gc", "--root", root})
+	})
+	if gcErr == nil {
+		t.Fatal("expected gc over a case-variant index to fail")
+	}
+	if !strings.Contains(gcErr.Error(), "current index is corrupt") {
+		t.Fatalf("error %q does not report the corrupt index", gcErr)
+	}
+	if out != "" {
+		t.Fatalf("failed gc printed a report: %q", out)
+	}
+
+	// verify: no success line.
+	var verifyErr error
+	out = captureStdout(t, func() {
+		verifyErr = run([]string{"verify", "--root", root})
+	})
+	if verifyErr == nil {
+		t.Fatal("expected verify over a case-variant index to fail")
+	}
+	if strings.Contains(out, "verified") {
+		t.Fatalf("failed verify printed a success line: %q", out)
+	}
+
+	// The corrupt index bytes are preserved.
+	after, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(corrupt) {
+		t.Fatalf("corrupt index was rewritten\nwas: %s\nnow: %s", corrupt, after)
+	}
+
+	// A healthy snapshot still restores over the corrupt index.
+	out = captureStdout(t, func() {
+		if err := run([]string{"snapshot", "restore", "--root", root, "--name", "snap"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "restored snapshot snap") {
+		t.Fatalf("restore over a corrupt index did not succeed: %q", out)
+	}
+	out = captureStdout(t, func() {
+		if err := run([]string{"list", "--root", root}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "keep.txt") {
+		t.Fatalf("restored repository does not list its artifact: %q", out)
+	}
+}
