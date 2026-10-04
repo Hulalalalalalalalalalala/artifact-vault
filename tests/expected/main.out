@@ -1,0 +1,7 @@
+Encoding: PEM
+Subject: C=CN, O=示例科技有限公司, OU=研发部, CN=中文示例证书
+Issuer: C=CN, O=示例科技有限公司, OU=研发部, CN=中文示例证书
+Not Before: 2026-10-04T16:40:27Z
+Not After: 2036-10-01T16:40:27Z
+SHA-256 Fingerprint: 9C:69:4F:50:6B:4F:E9:9E:C8:0A:F1:AB:B7:17:3F:F1:94:74:36:31:56:1D:A8:BB:3B:03:3A:1A:27:59:14:EB
+Note: this output displays certificate information only; reading the file successfully does not verify the signature or establish trust.

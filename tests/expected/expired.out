@@ -1,0 +1,7 @@
+Encoding: PEM
+Subject: C=CN, O=trustpeek test, CN=expired.example
+Issuer: C=CN, O=示例科技有限公司, OU=研发部, CN=中文示例证书
+Not Before: 2000-01-01T00:00:00Z
+Not After: 2001-01-01T00:00:00Z
+SHA-256 Fingerprint: E5:AD:40:55:8F:96:99:95:4E:EF:8F:86:DE:AA:DE:33:A1:23:4E:31:4E:CC:E8:F9:B9:3E:CB:B1:CD:9E:BE:AA
+Note: this output displays certificate information only; reading the file successfully does not verify the signature or establish trust.

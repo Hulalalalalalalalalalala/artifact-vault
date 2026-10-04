@@ -96,3 +96,36 @@ Note: this output displays certificate information only; reading the file succes
 | 2 | 用法错误：缺少检查路径、参数多余、命令未知（同时打印用法说明） |
 
 失败时标准输出不会留下任何半截证书信息。
+
+## 回归测试
+
+`inspect` 的单证书读取行为由 `tests/run_tests.sh` 守护，围绕真实命令行的
+退出码、完整标准输出和标准错误断言，不依赖联网服务或系统信任库：
+
+- PEM 与 DER 两种形式的成功输出（含末尾 Note），以及除 `Encoding` 外所有字段一致；
+- 扩展名与内容相反时仍按内容报告编码；
+- PEM 块前后空白（空格、制表符、空行、CRLF）容忍；DER 后多出哪怕一个字节也拒绝；
+- 第二个 PEM 证书块、块外非空白文字、空文件、仅空白、截断证书、仅公钥/私钥等一律
+  返回 1，标准输出为空，标准错误包含输入路径；
+- 过期证书、自签名证书仍完整展示并返回 0，Note 保留。
+
+测试夹具位于 `tests/fixtures/`，期望输出位于 `tests/expected/`，均为确定性内容并随
+仓库提交，可直接离线运行。需要重新生成夹具时（如更换 OpenSSL 版本）执行：
+
+```sh
+./tests/generate_fixtures.sh
+```
+
+构建后通过 ctest 运行：
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+也可以直接运行脚本（默认使用 `./build/trustpeek`，可用 `TRUSTPEEK` 覆盖路径）：
+
+```sh
+./tests/run_tests.sh
+```
