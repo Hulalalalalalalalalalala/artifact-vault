@@ -246,9 +246,17 @@ func (s *Store) RestoreSnapshot(name string) error {
 //   - "name": present and a string equal to wantName, including every level of
 //     a multi-level name; a missing, wrong-type, or merely-suffixed name
 //     (record "stable" under "releases/stable") is refused;
-//   - "entries": present and a JSON object. {} is a legitimate empty mapping;
-//     a missing field, a null, an array, or any non-object value is
-//     corruption rather than zero entries.
+//   - "entries": present, spelled exactly "entries", and a JSON object. {} is
+//     a legitimate empty mapping; a missing field, a null, an array, or any
+//     non-object value is corruption rather than zero entries. A field whose
+//     decoded name matches "entries" only case-insensitively ("Entries",
+//     "ENTRIES", ...) is corruption too — alone or beside the standard field,
+//     in either order, empty or not — because encoding/json would bind it to
+//     the entries mapping and let one spelling silently overwrite the other.
+//     The spelling is judged after JSON string decoding: an escape that
+//     decodes to "entries" is the standard field, one that decodes to a case
+//     variant is refused. Artifact names inside the mapping stay
+//     case-sensitive; this rule covers only the top-level mapping field.
 //
 // Every entry is then checked with validateEntryRecord. The errors
 // distinguish a missing entries mapping, a mismatching recorded name, and a
@@ -263,6 +271,19 @@ func decodeSnapshotRecord(data []byte, wantName string) (Snapshot, error) {
 	// a malformed record, never an empty snapshot.
 	if trimmed := bytes.TrimSpace(data); len(trimmed) == 0 || trimmed[0] != '{' {
 		return Snapshot{}, errors.New("malformed record: expected a JSON object with name and entries")
+	}
+	// The entries mapping must be spelled exactly "entries": encoding/json
+	// binds struct fields case-insensitively, so an "Entries" or "ENTRIES"
+	// field would silently populate the mapping — and, when both spellings
+	// appear, whichever came last would silently overwrite the other, letting
+	// an empty variant erase the recorded artifact references. Any such
+	// variant is corruption whether it appears alone or beside the standard
+	// field, in either order, with identical or different content, empty or
+	// not. Names are compared after JSON string decoding, so "entries"
+	// written through Unicode escapes stays valid while an escape decoding to
+	// a case variant is rejected.
+	if err := rejectEntriesCaseVariants(data); err != nil {
+		return Snapshot{}, fmt.Errorf("malformed record: %w", err)
 	}
 	var raw struct {
 		Name    *string          `json:"name"`
