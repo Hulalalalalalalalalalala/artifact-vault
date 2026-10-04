@@ -1,8 +1,12 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -312,6 +316,100 @@ func TestSnapshotListCLIAtomicOnCorruption(t *testing.T) {
 	})
 	if out != "" {
 		t.Fatalf("fresh repository listed output: %q", out)
+	}
+}
+
+// TestSnapshotImportCLIRejectsRecordSizeMismatch confirms the command line
+// fails (non-zero error, no "imported" success line) when a package's target
+// record sizes an artifact differently from the carried content, and that no
+// content object or snapshot is left behind in the destination.
+func TestSnapshotImportCLIRejectsRecordSizeMismatch(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "vault")
+	in := filepath.Join(t.TempDir(), "a.txt")
+	const content = "abcdefg" // 7 bytes
+	if err := os.WriteFile(in, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", src}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", src, "--name", "a.txt", "--file", in}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"snapshot", "create", "--root", src, "--name", "s"}); err != nil {
+		t.Fatal(err)
+	}
+	pkg := filepath.Join(t.TempDir(), "s.pkg")
+	if err := run([]string{"snapshot", "export", "--root", src, "--name", "s", "--output", pkg}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt only the snapshot record's size (8) while the carried object
+	// honestly stays 7 bytes. The entry is the unique size field followed by a
+	// createdAt, distinct from the object record's size/data pair.
+	raw, err := os.ReadFile(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(content))
+	digest := hex.EncodeToString(sum[:])
+	got := string(raw)
+	// The entry size is the one followed by createdAt (the object record's is
+	// followed by data), so the rewrite hits only the snapshot record.
+	entrySize := regexp.MustCompile(`("size": )7(,\s+"createdAt")`)
+	objectSize := regexp.MustCompile(`("size": )7(,\s+"data":)`)
+	if entrySize.FindString(got) == "" {
+		t.Fatalf("test package did not contain the expected entry record: %s", got)
+	}
+	got = entrySize.ReplaceAllString(got, `${1}8${2}`)
+	if err := os.WriteFile(pkg, []byte(got), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The carried object record stays truthful (7 bytes + matching base64), so
+	// the failure is a record-size mismatch rather than bad content.
+	if objectSize.FindString(got) == "" ||
+		!strings.Contains(got, `"data": "`+base64.StdEncoding.EncodeToString([]byte(content))+`"`) {
+		t.Fatal("test setup damaged the object record instead of the snapshot entry")
+	}
+
+	dst := filepath.Join(t.TempDir(), "vault")
+	if err := run([]string{"init", "--root", dst}); err != nil {
+		t.Fatal(err)
+	}
+	var importErr error
+	out := captureStdout(t, func() {
+		importErr = run([]string{"snapshot", "import", "--root", dst, "--file", pkg})
+	})
+	if importErr == nil {
+		t.Fatal("expected import of a mis-sized record to fail")
+	}
+	msg := importErr.Error()
+	for _, want := range []string{`snapshot "s"`, "a.txt", digest, "8", "7"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q does not report %q", msg, want)
+		}
+	}
+	if strings.Contains(out, "imported snapshot") {
+		t.Fatalf("failed import printed a success line: %q", out)
+	}
+
+	// No snapshot and no content object may remain.
+	listOut := captureStdout(t, func() {
+		if err := run([]string{"snapshot", "list", "--root", dst}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if listOut != "" {
+		t.Fatalf("snapshot left behind: %q", listOut)
+	}
+	if entries, err := os.ReadDir(filepath.Join(dst, "objects")); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, ent := range entries {
+			if !strings.HasPrefix(ent.Name(), ".") {
+				t.Fatalf("content object left behind after failed import: %s", ent.Name())
+			}
+		}
 	}
 }
 

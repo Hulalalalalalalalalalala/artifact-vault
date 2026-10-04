@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -739,6 +740,14 @@ func TestDecodePackageRejectsMalformedDocuments(t *testing.T) {
 			p.Objects[0].Size = 999
 			return p
 		},
+		"snapshot entry size disagrees with healthy content": func() Package {
+			p := base()
+			// The object record stays truthful (7 bytes of payload); only the
+			// snapshot record lies. A second name shares the same digest with
+			// the correct size to prove every name is checked independently.
+			p.Snapshot.Entries["b.txt"] = Entry{Name: "b.txt", Digest: d, Size: 8, CreatedAt: stamp}
+			return p
+		},
 		"bad base64": func() Package {
 			p := base()
 			p.Objects[0].Data = "!!!not base64!!!"
@@ -793,6 +802,298 @@ var stamp = func() time.Time {
 	}
 	return t
 }()
+
+// entryRec builds a package entry record for tests.
+func entryRec(name, digest string, size int64) Entry {
+	return Entry{Name: name, Digest: digest, Size: size, CreatedAt: stamp}
+}
+
+// packageObject builds a truthful carried object for content.
+func packageObject(content string) PackageObject {
+	return PackageObject{
+		Digest: digestOf(content),
+		Size:   int64(len(content)),
+		Data:   base64.StdEncoding.EncodeToString([]byte(content)),
+	}
+}
+
+// writePackage marshals a hand-built package to a file and returns its path.
+func writePackage(t *testing.T, pkg Package) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "package.vaultpkg")
+	data, err := json.Marshal(&pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// objectDirNames lists every entry name directly in a repository's objects
+// directory, including leftover temporary files.
+func objectDirNames(t *testing.T, root string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(filepath.Join(root, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(ents))
+	for _, ent := range ents {
+		names = append(names, ent.Name())
+	}
+	sort.Strings(names)
+	return names
+}
+
+func assertNoTemporaryFiles(t *testing.T, root string) {
+	t.Helper()
+	for _, dir := range []string{"objects", "snapshots", "."} {
+		ents, err := os.ReadDir(filepath.Join(root, dir))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ent := range ents {
+			if strings.HasPrefix(ent.Name(), ".") && ent.Name() != ".lock" {
+				t.Fatalf("leftover temporary file %s in %s", ent.Name(), dir)
+			}
+		}
+	}
+}
+
+// TestImportRejectsRecordSizeMismatchWithoutLeavingObject reproduces the
+// defect: a package carries healthy 7-byte content (its object record honestly
+// says 7), but the target snapshot records 8 for one of the two names that
+// share the digest. Import must refuse the whole package and leave neither the
+// new content object, a snapshot, nor a temporary file behind, and the error
+// must identify the snapshot, artifact, digest, recorded size, and actual byte
+// count as a record problem rather than a checksum failure.
+func TestImportRejectsRecordSizeMismatchWithoutLeavingObject(t *testing.T) {
+	const content = "abcdefg" // exactly 7 bytes
+	d := digestOf(content)
+	pkg := Package{
+		Format:  packageFormat,
+		Version: packageVersion,
+		Snapshot: Snapshot{Name: "s", Entries: map[string]Entry{
+			// a.txt sorts first and is correct; b.txt shares the digest but
+			// lies about the size. Every name must be checked, not just one.
+			"a.txt": entryRec("a.txt", d, 7),
+			"b.txt": entryRec("b.txt", d, 8),
+		}},
+		Objects: []PackageObject{packageObject(content)},
+	}
+	path := writePackage(t, pkg)
+
+	dst, _ := seedVault(t, map[string]string{"keep.txt": "keep"})
+	before := objectDirNames(t, dst)
+
+	res, err := New(dst).ImportSnapshot(path)
+	if err == nil {
+		t.Fatal("import accepted a snapshot record whose size disagrees with its content")
+	}
+	msg := err.Error()
+	for _, want := range []string{`snapshot "s"`, "b.txt", d, "8", "7"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q does not report %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "checksum") {
+		t.Fatalf("a record-size mismatch was reported as a checksum failure: %q", msg)
+	}
+	if res != (ImportResult{}) {
+		t.Fatalf("failed import returned a usable result: %+v", res)
+	}
+	if objectExists(dst, d) {
+		t.Fatal("failed import installed the content object anyway")
+	}
+	if infos, _ := New(dst).ListSnapshots(); len(infos) != 0 {
+		t.Fatalf("failed import published a snapshot: %+v", infos)
+	}
+	if after := objectDirNames(t, dst); strings.Join(after, ",") != strings.Join(before, ",") {
+		t.Fatalf("objects directory changed\nbefore: %v\nafter:  %v", before, after)
+	}
+	assertNoTemporaryFiles(t, dst)
+
+	// The current mapping is untouched.
+	entries, err := New(dst).List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name != "keep.txt" {
+		t.Fatalf("current mapping changed after failed import: %+v", entries)
+	}
+}
+
+// TestImportRejectsWrongSizeEvenWhenItSortsFirst flips the shared-digest case:
+// the lying record must be caught regardless of name order.
+func TestImportRejectsWrongSizeEvenWhenItSortsFirst(t *testing.T) {
+	const content = "abcdefg" // 7 bytes
+	d := digestOf(content)
+	pkg := Package{
+		Format:  packageFormat,
+		Version: packageVersion,
+		Snapshot: Snapshot{Name: "s", Entries: map[string]Entry{
+			"a.txt": entryRec("a.txt", d, 8), // wrong, sorts first
+			"z.txt": entryRec("z.txt", d, 7), // correct
+		}},
+		Objects: []PackageObject{packageObject(content)},
+	}
+	dst := filepath.Join(t.TempDir(), "vault")
+	if err := New(dst).Init(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := New(dst).ImportSnapshot(writePackage(t, pkg))
+	if err == nil {
+		t.Fatal("import accepted the wrong-size record")
+	}
+	if !strings.Contains(err.Error(), "a.txt") || res != (ImportResult{}) {
+		t.Fatalf("unexpected err=%v res=%+v", err, res)
+	}
+	if objectExists(dst, d) {
+		t.Fatal("failed import left the object behind")
+	}
+}
+
+// TestImportDeltaRejectsOmittedRecordSizeMismatch covers incremental packages:
+// the object the delta omits is healthy in the destination via a matching
+// base, but the target record keeps its digest while declaring another size.
+// The package also carries a correct new object; neither it nor the target
+// snapshot may remain after the refusal.
+func TestImportDeltaRejectsOmittedRecordSizeMismatchWithoutLeavingNewObject(t *testing.T) {
+	const oldData = "olddata" // 7 bytes, present through the base
+	const newData = "brand new"
+	dOld := digestOf(oldData)
+	dNew := digestOf(newData)
+
+	dst := filepath.Join(t.TempDir(), "vault")
+	if err := New(dst).Init(); err != nil {
+		t.Fatal(err)
+	}
+	// Establish the matching base snapshot and its object in the destination.
+	basePkg := Package{
+		Format:   packageFormat,
+		Version:  packageVersion,
+		Snapshot: Snapshot{Name: "base", Entries: map[string]Entry{"keep.txt": entryRec("keep.txt", dOld, 7)}},
+		Objects:  []PackageObject{packageObject(oldData)},
+	}
+	if _, err := New(dst).ImportSnapshot(writePackage(t, basePkg)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delta: keep.txt keeps the base digest but lies about the size (omitted
+	// object); new.txt is a correct, carried, genuinely new object.
+	delta := Package{
+		Format: packageFormat, Version: packageVersion,
+		Snapshot: Snapshot{Name: "target", Entries: map[string]Entry{
+			"keep.txt": entryRec("keep.txt", dOld, 8),
+			"new.txt":  entryRec("new.txt", dNew, int64(len(newData))),
+		}},
+		Base:    &Snapshot{Name: "base", Entries: map[string]Entry{"keep.txt": entryRec("keep.txt", dOld, 7)}},
+		Objects: []PackageObject{packageObject(newData)},
+	}
+	res, err := New(dst).ImportSnapshot(writePackage(t, delta))
+	if err == nil {
+		t.Fatal("delta imported a target record that mis-sizes an omitted base object")
+	}
+	msg := err.Error()
+	for _, want := range []string{`snapshot "target"`, "keep.txt", dOld, "8", "7"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q does not report %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "checksum") {
+		t.Fatalf("record-size mismatch reported as checksum failure: %q", msg)
+	}
+	if res != (ImportResult{}) {
+		t.Fatalf("failed delta returned a usable result: %+v", res)
+	}
+	if objectExists(dst, dNew) {
+		t.Fatal("failed delta left the correct new object behind anyway")
+	}
+	// Only the base snapshot survives; target is never published.
+	if infos, _ := New(dst).ListSnapshots(); len(infos) != 1 || infos[0].Name != "base" {
+		t.Fatalf("snapshots after failed delta: %+v", infos)
+	}
+	// The pre-existing base object is byte-for-byte unchanged.
+	got, err := os.ReadFile(filepath.Join(dst, "objects", dOld))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != oldData {
+		t.Fatalf("base object altered: %q", got)
+	}
+	if names := objectDirNames(t, dst); len(names) != 1 || names[0] != dOld {
+		t.Fatalf("objects directory after failed delta: %v", names)
+	}
+	assertNoTemporaryFiles(t, dst)
+}
+
+// TestImportRecordSizeMismatchRejectsOtherCorrectObjects makes the "no partial
+// save" rule explicit: a fully correct new object carried beside the bad
+// record is installed only if the whole package is valid.
+func TestImportRecordSizeMismatchRejectsOtherCorrectObjects(t *testing.T) {
+	const bad = "abcdefg" // 7-byte content recorded as 8
+	const good = "totally fine separate content"
+	dBad := digestOf(bad)
+	dGood := digestOf(good)
+	pkg := Package{
+		Format:  packageFormat,
+		Version: packageVersion,
+		Snapshot: Snapshot{Name: "s", Entries: map[string]Entry{
+			"bad.txt":  entryRec("bad.txt", dBad, 8),
+			"good.txt": entryRec("good.txt", dGood, int64(len(good))),
+		}},
+		Objects: []PackageObject{packageObject(bad), packageObject(good)},
+	}
+	dst := filepath.Join(t.TempDir(), "vault")
+	if err := New(dst).Init(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(dst).ImportSnapshot(writePackage(t, pkg)); err == nil {
+		t.Fatal("import accepted a package containing one mis-sized record")
+	}
+	if objectExists(dst, dBad) {
+		t.Fatal("the mis-sized object was installed")
+	}
+	if objectExists(dst, dGood) {
+		t.Fatal("the other, correct object was partially installed")
+	}
+	if infos, _ := New(dst).ListSnapshots(); len(infos) != 0 {
+		t.Fatalf("snapshot published: %+v", infos)
+	}
+	assertNoTemporaryFiles(t, dst)
+}
+
+// TestImportZeroByteContentWithZeroSizeImports pins the legitimate edge:
+// empty content and a zero-size record are valid and transfer normally.
+func TestImportZeroByteContentWithZeroSizeImports(t *testing.T) {
+	d0 := digestOf("")
+	pkg := Package{
+		Format:   packageFormat,
+		Version:  packageVersion,
+		Snapshot: Snapshot{Name: "s", Entries: map[string]Entry{"empty.txt": entryRec("empty.txt", d0, 0)}},
+		Objects:  []PackageObject{{Digest: d0, Size: 0, Data: ""}},
+	}
+	dst := filepath.Join(t.TempDir(), "vault")
+	if err := New(dst).Init(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := New(dst).ImportSnapshot(writePackage(t, pkg))
+	if err != nil {
+		t.Fatalf("zero-byte import failed: %v", err)
+	}
+	if res.Entries != 1 || res.NewObjects != 1 {
+		t.Fatalf("result=%+v, want 1 entry 1 new object", res)
+	}
+	if !objectExists(dst, d0) {
+		t.Fatal("zero-byte object missing after import")
+	}
+	assertEntriesAfterRestore(t, dst, "s", map[string]string{"empty.txt": ""})
+}
 
 func TestImportRejectsMalformedPackageWithoutSideEffects(t *testing.T) {
 	dst, _ := seedVault(t, map[string]string{"keep.txt": "keep"})

@@ -136,11 +136,17 @@ func marshalPackage(pkg *Package) ([]byte, error) {
 //     its length and SHA-256 match the record;
 //   - the object set carries exactly the objects required by the snapshot
 //     mapping minus the base mapping (all of them for a full package),
-//     neither omitting a referenced digest nor carrying an unreferenced one.
+//     neither omitting a referenced digest nor carrying an unreferenced one;
+//   - every target entry records the exact byte count of the content its
+//     digest identifies when that content is carried: an entry keeping a valid
+//     digest but declaring another size is a corrupt record, even though the
+//     object record itself is intact.
 //
-// Cross-repository checks (an existing base snapshot, objects already present
-// in the destination, name collisions) are performed later by import, which
-// has the destination in hand.
+// Sizes for objects a delta omits cannot be checked until the package meets a
+// matching, healthy base in the destination; import performs that check before
+// anything is written. Other cross-repository checks (an existing base
+// snapshot, objects already present in the destination, name collisions) are
+// likewise performed later by import, which has the destination in hand.
 func decodePackage(data []byte) (*Package, error) {
 	// encoding/json silently keeps the last value when an object lists a key
 	// twice; that would let a package hide a duplicate entry or overwrite a
@@ -232,9 +238,9 @@ func decodePackage(data []byte) (*Package, error) {
 			delete(needed, digest)
 		}
 	}
-	carried := map[string]struct{}{}
+	carried := map[string]int64{}
 	for _, obj := range pkg.Objects {
-		carried[obj.Digest] = struct{}{}
+		carried[obj.Digest] = obj.Size
 	}
 	for digest := range needed {
 		if _, ok := carried[digest]; !ok {
@@ -246,7 +252,55 @@ func decodePackage(data []byte) (*Package, error) {
 			return nil, fmt.Errorf("invalid package: object %s is not referenced by the target mapping", digest)
 		}
 	}
+	// Every target entry whose content the package carries must record the
+	// carried content's exact byte count. The object's own record was already
+	// proven to match its payload above, so an entry size that disagrees is a
+	// corrupt snapshot record rather than corrupt content. Each name is
+	// checked separately: one digest may be referenced by several entries, and
+	// all of them must agree. Objects a delta omits are checked later against
+	// the destination by import. Entries are visited in name order so the
+	// first reported artifact is deterministic.
+	for _, key := range sortedEntryNames(pkg.Snapshot.Entries) {
+		entry := pkg.Snapshot.Entries[key]
+		actual, isCarried := carried[entry.Digest]
+		if isCarried && entry.Size != actual {
+			return nil, fmt.Errorf("invalid package: %w", newEntrySizeMismatchError(pkg.Snapshot.Name, entry.Name, entry.Digest, entry.Size, actual))
+		}
+	}
 	return pkg, nil
+}
+
+// sortedEntryNames returns a snapshot's entry keys in sorted order, so checks
+// that may report one of several entries name a deterministic artifact.
+func sortedEntryNames(entries map[string]Entry) []string {
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// entrySizeMismatchError reports a target snapshot entry whose recorded size
+// disagrees with the actual byte count of the content its digest identifies.
+// The digest matches healthy content, so this is record corruption — distinct
+// from a checksum failure or missing content — and the fields name everything
+// a user needs to tell them apart.
+type entrySizeMismatchError struct {
+	snapshot string
+	artifact string
+	digest   string
+	recorded int64
+	actual   int64
+}
+
+func newEntrySizeMismatchError(snapshot, artifact, digest string, recorded, actual int64) error {
+	return entrySizeMismatchError{snapshot: snapshot, artifact: artifact, digest: digest, recorded: recorded, actual: actual}
+}
+
+func (e entrySizeMismatchError) Error() string {
+	return fmt.Sprintf("snapshot %q entry %q references content %s but records size %d; the content is %d bytes",
+		e.snapshot, e.artifact, e.digest, e.recorded, e.actual)
 }
 
 // validateSnapshotRecord validates one embedded snapshot the same way restore
