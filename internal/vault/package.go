@@ -132,8 +132,11 @@ func marshalPackage(pkg *Package) ([]byte, error) {
 //
 //   - known format and version;
 //   - snapshot (and base, if present) records are complete and valid:
-//     snapshot name legal, entries keyed by their recorded name, legal names,
-//     64 lowercase-hex digests, non-negative sizes;
+//     snapshot name legal, entries mapping spelled exactly "entries" (any
+//     case-variant spelling such as "Entries" is corruption, alone or beside
+//     the standard field, in either order, empty or not — see
+//     decodePackageSnapshot), entries keyed by their recorded name, legal
+//     names, 64 lowercase-hex digests, non-negative sizes;
 //   - every object digest is valid and unique, the base64 data decodes, and
 //     its length and SHA-256 match the record;
 //   - the object set carries exactly the objects required by the snapshot
@@ -161,8 +164,8 @@ func decodePackage(data []byte) (*Package, error) {
 	var raw struct {
 		Format   string             `json:"format"`
 		Version  int                `json:"version"`
-		Snapshot Snapshot           `json:"snapshot"`
-		Base     *Snapshot          `json:"base,omitempty"`
+		Snapshot json.RawMessage    `json:"snapshot"`
+		Base     json.RawMessage    `json:"base"`
 		Objects  *[]json.RawMessage `json:"objects"`
 	}
 	if err := dec.Decode(&raw); err != nil {
@@ -185,15 +188,23 @@ func decodePackage(data []byte) (*Package, error) {
 	}
 
 	pkg := &Package{Format: raw.Format, Version: raw.Version, Objects: []PackageObject{}}
-	if err := validateSnapshotRecord("snapshot", raw.Snapshot); err != nil {
+	snapshot, err := decodePackageSnapshot("snapshot", raw.Snapshot)
+	if err != nil {
 		return nil, err
 	}
-	pkg.Snapshot = raw.Snapshot
-	if raw.Base != nil {
-		if err := validateSnapshotRecord("base", *raw.Base); err != nil {
+	if err := validateSnapshotRecord("snapshot", snapshot); err != nil {
+		return nil, err
+	}
+	pkg.Snapshot = snapshot
+	if base := bytes.TrimSpace(raw.Base); len(base) > 0 && string(base) != "null" {
+		baseSnap, err := decodePackageSnapshot("base", raw.Base)
+		if err != nil {
 			return nil, err
 		}
-		pkg.Base = raw.Base
+		if err := validateSnapshotRecord("base", baseSnap); err != nil {
+			return nil, err
+		}
+		pkg.Base = &baseSnap
 	}
 
 	seen := map[string]struct{}{}
@@ -270,6 +281,41 @@ func decodePackage(data []byte) (*Package, error) {
 		}
 	}
 	return pkg, nil
+}
+
+// decodePackageSnapshot decodes one snapshot record embedded in a package —
+// the target snapshot (scope "snapshot") or the delta base (scope "base") —
+// and holds its mapping field to the same rule decodeSnapshotRecord applies
+// to records on disk: the entries mapping must be spelled exactly "entries".
+// encoding/json binds struct fields case-insensitively, so without this check
+// an "Entries" field would silently populate the mapping on its own, and a
+// record carrying both spellings would keep only whichever came last —
+// dropping artifact records or installing an empty mapping. Any case-variant
+// spelling is therefore corruption, alone or beside the standard field, in
+// either order, with identical or different content, empty or not. Field
+// names are compared after JSON string decoding, so "entries" written through
+// Unicode escapes stays valid while an escape decoding to a case variant is
+// rejected. The rule constrains only the record's mapping field; artifact
+// names remain case-sensitive. A violation is reported with the scope, the
+// record's full snapshot name, and the offending field, so it is never
+// mistaken for a missing base or a content checksum failure.
+func decodePackageSnapshot(scope string, raw json.RawMessage) (Snapshot, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		// A missing or null record decodes to the zero record, exactly as a
+		// direct struct decode produced, and fails record validation below.
+		trimmed = []byte("{}")
+	}
+	var snap Snapshot
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&snap); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid package: %s snapshot record is malformed: %w", scope, err)
+	}
+	if err := rejectEntriesCaseVariants(trimmed); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid package: %s snapshot %q: %w", scope, snap.Name, err)
+	}
+	return snap, nil
 }
 
 // sortedEntryNames returns a snapshot's entry keys in sorted order, so checks

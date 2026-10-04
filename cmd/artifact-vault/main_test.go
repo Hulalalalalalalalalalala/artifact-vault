@@ -513,6 +513,98 @@ func TestSnapshotImportCLIRejectsRecordSizeMismatch(t *testing.T) {
 	}
 }
 
+// TestSnapshotImportCLIRejectsEntriesCaseVariant confirms the command line
+// refuses a package whose target snapshot record spells the entries mapping
+// "Entries": the command fails naming the snapshot and the offending field,
+// prints no "imported" success line, and leaves no snapshot, object, or
+// temporary file behind — while the same package with the standard spelling
+// imports and prints its success line.
+func TestSnapshotImportCLIRejectsEntriesCaseVariant(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "vault")
+	in := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(in, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", src}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", src, "--name", "a.txt", "--file", in}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"snapshot", "create", "--root", src, "--name", "s"}); err != nil {
+		t.Fatal(err)
+	}
+	pkg := filepath.Join(t.TempDir(), "s.pkg")
+	if err := run([]string{"snapshot", "export", "--root", src, "--name", "s", "--output", pkg}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The full package spells the mapping field exactly once; recasing it
+	// leaves every other byte — entries, objects, checksums — intact.
+	raw, err := os.ReadFile(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(raw), `"entries"`) != 1 {
+		t.Fatalf("test package does not hold exactly one entries field: %s", raw)
+	}
+	corrupt := filepath.Join(t.TempDir(), "corrupt.pkg")
+	if err := os.WriteFile(corrupt,
+		[]byte(strings.Replace(string(raw), `"entries"`, `"Entries"`, 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "vault")
+	if err := run([]string{"init", "--root", dst}); err != nil {
+		t.Fatal(err)
+	}
+	var importErr error
+	out := captureStdout(t, func() {
+		importErr = run([]string{"snapshot", "import", "--root", dst, "--file", corrupt})
+	})
+	if importErr == nil {
+		t.Fatal("expected import of a case-variant entries field to fail")
+	}
+	msg := importErr.Error()
+	for _, want := range []string{`snapshot "s"`, `"Entries"`, `must be spelled exactly "entries"`} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q does not report %q", msg, want)
+		}
+	}
+	if strings.Contains(out, "imported snapshot") {
+		t.Fatalf("failed import printed a success line: %q", out)
+	}
+	listOut := captureStdout(t, func() {
+		if err := run([]string{"snapshot", "list", "--root", dst}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if listOut != "" {
+		t.Fatalf("snapshot left behind: %q", listOut)
+	}
+	if entries, err := os.ReadDir(filepath.Join(dst, "objects")); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, ent := range entries {
+			t.Fatalf("object or temporary file left behind after failed import: %s", ent.Name())
+		}
+	}
+
+	// The untouched package still imports and prints its success line.
+	dstOK := filepath.Join(t.TempDir(), "vault")
+	if err := run([]string{"init", "--root", dstOK}); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() {
+		if err := run([]string{"snapshot", "import", "--root", dstOK, "--file", pkg}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "imported snapshot s with 1 entries, 1 new objects") {
+		t.Fatalf("healthy import lost its success line: %q", out)
+	}
+}
+
 // TestSnapshotRestoreCLIMissingName fails without a success line when the
 // snapshot does not exist, distinguishing "not found" from corruption.
 func TestSnapshotRestoreCLIMissingName(t *testing.T) {
