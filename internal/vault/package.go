@@ -132,8 +132,11 @@ func marshalPackage(pkg *Package) ([]byte, error) {
 //
 //   - known format and version;
 //   - snapshot (and base, if present) records are complete and valid:
-//     snapshot name legal, entries keyed by their recorded name, legal names,
-//     64 lowercase-hex digests, non-negative sizes;
+//     snapshot name legal, mapping field spelled exactly "entries" (a JSON
+//     object; {} is a legitimate empty mapping — any case-variant spelling
+//     such as "Entries" is invalid alone or beside the standard field, a
+//     missing/null/non-object mapping is invalid), entries keyed by their
+//     recorded name, legal names, 64 lowercase-hex digests, non-negative sizes;
 //   - every object digest is valid and unique, the base64 data decodes, and
 //     its length and SHA-256 match the record;
 //   - the object set carries exactly the objects required by the snapshot
@@ -158,11 +161,16 @@ func decodePackage(data []byte) (*Package, error) {
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
+	// The nested snapshot records are kept raw here and decoded separately by
+	// decodePackageSnapshotRecord, which applies the same exact-"entries" rule
+	// as a stored snapshot record. Decoding them straight into Snapshot would
+	// bind case-variant spellings ("Entries") silently through encoding/json's
+	// case-insensitive field matching.
 	var raw struct {
 		Format   string             `json:"format"`
 		Version  int                `json:"version"`
-		Snapshot Snapshot           `json:"snapshot"`
-		Base     *Snapshot          `json:"base,omitempty"`
+		Snapshot json.RawMessage    `json:"snapshot"`
+		Base     *json.RawMessage   `json:"base,omitempty"`
 		Objects  *[]json.RawMessage `json:"objects"`
 	}
 	if err := dec.Decode(&raw); err != nil {
@@ -185,15 +193,17 @@ func decodePackage(data []byte) (*Package, error) {
 	}
 
 	pkg := &Package{Format: raw.Format, Version: raw.Version, Objects: []PackageObject{}}
-	if err := validateSnapshotRecord("snapshot", raw.Snapshot); err != nil {
+	targetSnap, err := decodePackageSnapshotRecord("target snapshot", raw.Snapshot)
+	if err != nil {
 		return nil, err
 	}
-	pkg.Snapshot = raw.Snapshot
+	pkg.Snapshot = targetSnap
 	if raw.Base != nil {
-		if err := validateSnapshotRecord("base", *raw.Base); err != nil {
+		baseSnap, err := decodePackageSnapshotRecord("incremental base snapshot", *raw.Base)
+		if err != nil {
 			return nil, err
 		}
-		pkg.Base = raw.Base
+		pkg.Base = &baseSnap
 	}
 
 	seen := map[string]struct{}{}
@@ -305,21 +315,114 @@ func (e entrySizeMismatchError) Error() string {
 		e.snapshot, e.artifact, e.digest, e.recorded, e.actual)
 }
 
-// validateSnapshotRecord validates one embedded snapshot the same way restore
-// and gc validate on-disk snapshots.
-func validateSnapshotRecord(scope string, snap Snapshot) error {
-	if err := validateName(snap.Name); err != nil {
-		return fmt.Errorf("invalid package: %s snapshot name %q is not a legal snapshot name", scope, snap.Name)
+// decodePackageSnapshotRecord parses one snapshot record embedded in a
+// package — the target snapshot, or the base record of an incremental
+// package — under the same exact-"entries" rule as an on-disk snapshot record
+// (see decodeSnapshotRecord). scope identifies which record it is in package
+// terms ("target snapshot" or "incremental base snapshot") so a corrupt field
+// is never misreported as a missing base or a content checksum failure.
+//
+// The record must be a single JSON object with no unknown fields, carrying:
+//
+//   - "name": present and a legal snapshot name;
+//   - "entries": present, spelled exactly "entries" after JSON string
+//     decoding, and a JSON object. A genuine {} is a legitimate empty mapping;
+//     a missing field, null, array, or other non-object value is invalid. A
+//     case-variant spelling ("Entries", "ENTRIES", ...) is invalid whether it
+//     appears alone or beside the standard field, in either order, with
+//     identical or different content, empty or not: encoding/json binds struct
+//     fields case-insensitively, so decoding straight into Snapshot would let
+//     the variant silently populate the mapping — and when both spellings
+//     appear, whichever came last would silently replace the other, dropping
+//     artifact records or installing an empty mapping. "entries" written
+//     through Unicode escapes stays valid; an escape decoding to a variant is
+//     rejected. The rule binds only this mapping field; artifact names remain
+//     case-sensitive.
+//
+// Every entry is then decoded with unknown fields rejected and checked with
+// validateEntryRecord. Duplicate keys anywhere in the package were already
+// rejected by rejectDuplicateKeys before this runs.
+func decodePackageSnapshotRecord(scope string, data json.RawMessage) (Snapshot, error) {
+	// The record must be a JSON object: a null, array, or primitive is an
+	// invalid record, never an empty snapshot.
+	if trimmed := bytes.TrimSpace(data); len(trimmed) == 0 || trimmed[0] != '{' {
+		return Snapshot{}, fmt.Errorf("invalid package: %s: record must be a JSON object with name and entries", scope)
 	}
-	if snap.Entries == nil {
-		return fmt.Errorf("invalid package: %s snapshot %q is missing its entries mapping", scope, snap.Name)
+	var raw struct {
+		Name    *string          `json:"name"`
+		Entries *json.RawMessage `json:"entries"`
 	}
-	for key, entry := range snap.Entries {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid package: %s: malformed record: %w", scope, err)
+	}
+	if tok, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return Snapshot{}, fmt.Errorf("invalid package: %s: malformed record: unexpected trailing content (%v)", scope, tok)
+		}
+		return Snapshot{}, fmt.Errorf("invalid package: %s: malformed record: %w", scope, err)
+	}
+	// Name the record by its recorded name in every later error when it carried
+	// one, legal or not, so the report names the full snapshot.
+	label := scope
+	if raw.Name != nil {
+		label = fmt.Sprintf(`%s %q`, scope, *raw.Name)
+	}
+	// A field that spells the entries mapping with different casing would be
+	// silently bound to it by the struct decode above — and would silently
+	// overwrite or be overwritten by the standard spelling when both appear —
+	// so any such field is invalid regardless of order, content, or emptiness.
+	// This runs before the present/type checks so a variant alone is reported
+	// as a variant, never as a missing entries mapping.
+	if err := rejectEntriesCaseVariants(data); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid package: %s: %w", label, err)
+	}
+	if raw.Name == nil {
+		return Snapshot{}, fmt.Errorf("invalid package: %s: record is missing its snapshot name", label)
+	}
+	if err := validateName(*raw.Name); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid package: %s: record name %q is not a legal snapshot name", scope, *raw.Name)
+	}
+	if raw.Entries == nil {
+		return Snapshot{}, fmt.Errorf("invalid package: %s: record is missing its entries mapping", label)
+	}
+	entriesJSON := *raw.Entries
+	if string(bytes.TrimSpace(entriesJSON)) == "null" {
+		return Snapshot{}, fmt.Errorf("invalid package: %s: record is missing its entries mapping", label)
+	}
+	// Decode the entries object strictly: unknown fields inside an entry record
+	// are rejected, exactly as the earlier whole-document decode did when it
+	// cascaded into the entry structs.
+	var rawEntries map[string]json.RawMessage
+	if err := json.Unmarshal(entriesJSON, &rawEntries); err != nil {
+		return Snapshot{}, fmt.Errorf("invalid package: %s: entries mapping is malformed: %w", label, err)
+	}
+	if rawEntries == nil {
+		return Snapshot{}, fmt.Errorf("invalid package: %s: record is missing its entries mapping", label)
+	}
+	entries := make(map[string]Entry, len(rawEntries))
+	for key := range rawEntries {
+		var entry Entry
+		edec := json.NewDecoder(bytes.NewReader(rawEntries[key]))
+		edec.DisallowUnknownFields()
+		if err := edec.Decode(&entry); err != nil {
+			return Snapshot{}, fmt.Errorf("invalid package: %s: entries mapping is malformed: %w", label, err)
+		}
+		if _, err := edec.Token(); err != io.EOF {
+			if err == nil {
+				return Snapshot{}, fmt.Errorf("invalid package: %s: entries mapping is malformed: unexpected trailing content in entry %q", label, key)
+			}
+			return Snapshot{}, fmt.Errorf("invalid package: %s: entries mapping is malformed: entry %q: %w", label, key, err)
+		}
+		entries[key] = entry
+	}
+	for key, entry := range entries {
 		if err := validateEntryRecord(key, entry); err != nil {
-			return fmt.Errorf("invalid package: %s snapshot %q: %w", scope, snap.Name, err)
+			return Snapshot{}, fmt.Errorf("invalid package: %s: %w", label, err)
 		}
 	}
-	return nil
+	return Snapshot{Name: *raw.Name, Entries: entries}, nil
 }
 
 // digestsReferenced returns the set of object digests referenced by a set of

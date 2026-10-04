@@ -513,6 +513,119 @@ func TestSnapshotImportCLIRejectsRecordSizeMismatch(t *testing.T) {
 	}
 }
 
+// TestSnapshotImportCLIRejectsCaseVariantEntries confirms the command line
+// refuses an ambiguous package whose target or base snapshot spells the
+// mapping field with a case variant: the command errors (non-zero), prints no
+// "imported" success line, names the target snapshot versus the incremental
+// base snapshot along with the full snapshot name and offending field, and
+// leaves no snapshot or object behind.
+func TestSnapshotImportCLIRejectsCaseVariantEntries(t *testing.T) {
+	// Build a healthy full package, then splice "entries" -> "Entries" in just
+	// the target snapshot record.
+	src := filepath.Join(t.TempDir(), "vault")
+	in := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(in, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"init", "--root", src}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", src, "--name", "a.txt", "--file", in}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"snapshot", "create", "--root", src, "--name", "s"}); err != nil {
+		t.Fatal(err)
+	}
+	pkgPath := filepath.Join(t.TempDir(), "s.pkg")
+	if err := run([]string{"snapshot", "export", "--root", src, "--name", "s", "--output", pkgPath}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(pkgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetDoc := strings.Replace(string(raw), `"snapshot": {
+    "name": "s",
+    "entries"`, `"snapshot": {
+    "name": "s",
+    "Entries"`, 1)
+	if targetDoc == string(raw) {
+		t.Fatalf("test setup could not locate the target entries field in:\n%s", raw)
+	}
+	targetPkg := filepath.Join(t.TempDir(), "target.pkg")
+	if err := os.WriteFile(targetPkg, []byte(targetDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "vault")
+	if err := run([]string{"init", "--root", dst}); err != nil {
+		t.Fatal(err)
+	}
+	var importErr error
+	out := captureStdout(t, func() {
+		importErr = run([]string{"snapshot", "import", "--root", dst, "--file", targetPkg})
+	})
+	if importErr == nil {
+		t.Fatal("expected CLI import of a case-variant target to fail")
+	}
+	msg := importErr.Error()
+	for _, want := range []string{"target snapshot", `snapshot "s"`, `"Entries"`} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q does not report %q", msg, want)
+		}
+	}
+	if strings.Contains(out, "imported snapshot") {
+		t.Fatalf("failed import printed a success line: %q", out)
+	}
+	// No snapshot or object may remain.
+	if listOut := captureStdout(t, func() {
+		if err := run([]string{"snapshot", "list", "--root", dst}); err != nil {
+			t.Fatal(err)
+		}
+	}); listOut != "" {
+		t.Fatalf("snapshot left behind: %q", listOut)
+	}
+	if ents, err := os.ReadDir(filepath.Join(dst, "objects")); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, ent := range ents {
+			if !strings.HasPrefix(ent.Name(), ".") {
+				t.Fatalf("content object left behind after failed import: %s", ent.Name())
+			}
+		}
+	}
+
+	// A base record carrying the variant is identified as the incremental base,
+	// not as a missing/unavailable base. Hand-build a minimal delta package.
+	sum := sha256.Sum256([]byte("payload"))
+	digest := hex.EncodeToString(sum[:])
+	entry := `{"a.txt":{"name":"a.txt","digest":"` + digest + `","size":7,"createdAt":"2026-01-01T00:00:00Z"}}`
+	delta := `{"format":"artifact-vault-snapshot","version":1,` +
+		`"snapshot":{"name":"t","entries":` + entry + `},` +
+		`"base":{"name":"b","Entries":` + entry + `},` +
+		`"objects":[{"digest":"` + digest + `","size":7,"data":"` +
+		base64.StdEncoding.EncodeToString([]byte("payload")) + `"}]}`
+	deltaPkg := filepath.Join(t.TempDir(), "delta.pkg")
+	if err := os.WriteFile(deltaPkg, []byte(delta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() {
+		importErr = run([]string{"snapshot", "import", "--root", dst, "--file", deltaPkg})
+	})
+	if importErr == nil {
+		t.Fatal("expected CLI import of a case-variant base to fail")
+	}
+	msg = importErr.Error()
+	for _, want := range []string{"incremental base snapshot", `snapshot "b"`, `"Entries"`} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q does not report %q", msg, want)
+		}
+	}
+	if strings.Contains(out, "imported snapshot") {
+		t.Fatalf("failed base import printed a success line: %q", out)
+	}
+}
+
 // TestSnapshotRestoreCLIMissingName fails without a success line when the
 // snapshot does not exist, distinguishing "not found" from corruption.
 func TestSnapshotRestoreCLIMissingName(t *testing.T) {
