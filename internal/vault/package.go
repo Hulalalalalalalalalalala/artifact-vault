@@ -125,6 +125,129 @@ func marshalPackage(pkg *Package) ([]byte, error) {
 	return append(data, '\n'), nil
 }
 
+// streamReader exposes only Read, hiding any WriteTo/ReaderFrom the underlying
+// reader may carry. io.CopyBuffer otherwise dispatches to *os.File.WriteTo,
+// which is harmless but would route the copy through code outside this
+// package; stripping the methods guarantees the supplied fixed-size buffer is
+// the only read buffer, so streaming an object never allocates with its size.
+type streamReader struct{ r io.Reader }
+
+func (sr streamReader) Read(p []byte) (int, error) { return sr.r.Read(p) }
+
+// packageObjectSource supplies one carried object's content on demand. The
+// reader is opened only while the object is being serialized and is closed
+// immediately afterwards, so an export of many objects holds one object file
+// open at a time and never its bytes.
+type packageObjectSource struct {
+	digest string
+	size   int64
+	open   func() (io.ReadCloser, error)
+}
+
+// writeStreamingPackage serializes a package with exactly the bytes
+// marshalPackage produces — same version, field order, two-space indentation,
+// JSON escaping, trailing newline, and standard base64 encoding — while
+// streaming each carried object's payload (and its base64 expansion) through
+// fixed-size buffers. Neither the raw object bytes nor their encoded form is
+// held in memory, so extra memory does not grow with an object's size or the
+// total byte count. The snapshot and base metadata are rendered the same way
+// marshalPackage renders them; objects must already be supplied in digest
+// order. An empty objects slice serializes as [].
+func writeStreamingPackage(w io.Writer, snap Snapshot, base *Snapshot, objects []packageObjectSource) error {
+	head, err := packageMetaHead(snap, base)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(head); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, ",\n  \"objects\": "); err != nil {
+		return err
+	}
+	if len(objects) == 0 {
+		_, err := io.WriteString(w, "[]\n}\n")
+		return err
+	}
+	if _, err := io.WriteString(w, "[\n"); err != nil {
+		return err
+	}
+	// One fixed buffer is reused for every object.
+	buf := make([]byte, exportBufferSize)
+	for i := range objects {
+		if err := writeStreamingObject(w, buf, objects[i]); err != nil {
+			return err
+		}
+		if i+1 < len(objects) {
+			if _, err := io.WriteString(w, ",\n"); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = io.WriteString(w, "\n  ]\n}\n")
+	return err
+}
+
+// packageMetaHead renders every package field before the objects array
+// (format, version, snapshot, and base when present) with the exact
+// indentation marshalPackage uses. MarshalIndent terminates the top-level
+// object with a "\n}" after its last field; those two bytes are dropped so the
+// caller can continue with ",\n  \"objects\": ..." and the document footer.
+func packageMetaHead(snap Snapshot, base *Snapshot) ([]byte, error) {
+	var meta struct {
+		Format   string    `json:"format"`
+		Version  int       `json:"version"`
+		Snapshot Snapshot  `json:"snapshot"`
+		Base     *Snapshot `json:"base,omitempty"`
+	}
+	meta.Format = packageFormat
+	meta.Version = packageVersion
+	meta.Snapshot = snap
+	meta.Base = base
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return data[:len(data)-2], nil
+}
+
+// writeStreamingObject writes one object record — opening the content,
+// base64-encoding it straight into the record's "data" string, and closing the
+// reader — without buffering the payload. Standard base64 uses only JSON-safe
+// characters, so the encoded bytes need no escaping and sit verbatim inside
+// the JSON string. The frame's indentation matches MarshalIndent for an
+// element of the top-level "objects" array.
+func writeStreamingObject(w io.Writer, buf []byte, obj packageObjectSource) (err error) {
+	rc, err := obj.open()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := rc.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+	// The digest is 64 lowercase hex characters, but marshal it to stay
+	// consistent with the JSON encoder regardless of content.
+	digestJSON, err := json.Marshal(obj.digest)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "    {\n      \"digest\": %s,\n      \"size\": %d,\n      \"data\": \"", digestJSON, obj.size); err != nil {
+		return err
+	}
+	enc := base64.NewEncoder(base64.StdEncoding, w)
+	if _, copyErr := io.CopyBuffer(enc, streamReader{rc}, buf); copyErr != nil {
+		_ = enc.Close()
+		return copyErr
+	}
+	// Close flushes the final, possibly padded base64 quantum.
+	if err := enc.Close(); err != nil {
+		return err
+	}
+	_, err = io.WriteString(w, "\"\n    }")
+	return err
+}
+
 // decodePackage parses a package without touching any repository. It enforces
 // every self-contained invariant the specification places on a package:
 //

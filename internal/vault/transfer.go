@@ -2,15 +2,21 @@ package vault
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 )
+
+// exportBufferSize bounds the memory an export uses to process any one
+// content object. Verification and base64 encoding both stream through a
+// buffer of this fixed size, so working memory is independent of object size
+// and of the sum of every object's bytes.
+const exportBufferSize = 32 * 1024
 
 // ExportResult summarizes a successful snapshot export.
 type ExportResult struct {
@@ -39,6 +45,14 @@ type ImportResult struct {
 // and SHA-256, including objects omitted from a delta, so a corrupt snapshot
 // record or a missing/damaged object never produces a successful package.
 //
+// Content is streamed: verification hashes each object through a fixed-size
+// buffer and serialization base64-encodes each carried object straight into the
+// output as it is read, one object at a time. Neither the object bytes nor
+// their encoded form are retained, so the extra memory an export needs does
+// not grow with the size of one object or the total bytes carried; only the
+// names, entries, and snapshot records stay resident, scaling with the number
+// of records.
+//
 // The output location is held to the same rules as a download: it must be
 // outside the source repository (judged on actual locations, through
 // symlinks, and before the file exists), its parent directory must already
@@ -47,9 +61,9 @@ type ImportResult struct {
 // is committed through a descriptor pinned to the resolved parent directory,
 // so a parent swapped for a symlink into the repository while the export runs
 // is detected at commit time and can never redirect the package onto a
-// repository file. The package is assembled in memory and written to a
-// temporary file in that directory before an atomic rename: a failed export
-// never creates or alters the output file.
+// repository file. The package is written to a temporary file in that
+// directory before an atomic rename: a failed export never creates or alters
+// the output file.
 func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) {
 	if err := validateName(name); err != nil {
 		return ExportResult{}, err
@@ -99,57 +113,75 @@ func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) 
 		if err != nil {
 			return err
 		}
-		pkg := &Package{
-			Format:   packageFormat,
-			Version:  packageVersion,
-			Snapshot: target,
-			Objects:  []PackageObject{},
-		}
 		var baseSnap Snapshot
+		haveBase := false
 		if base != "" {
-			var err error
 			baseSnap, err = s.loadSnapshotRecord(base)
 			if err != nil {
 				return fmt.Errorf("cannot use base snapshot: %w", err)
 			}
-			pkg.Base = &baseSnap
+			haveBase = true
 		}
 
-		// Verify every object the target references, reading each once. This
-		// includes objects the delta omits because the base references them:
-		// certifying the delta requires those to be intact too. Only objects
-		// the base does not reference are carried. Digests are processed in
-		// sorted order so the package layout and any failure message are
-		// deterministic.
+		// carry is the set of target digests a package must actually contain:
+		// every target digest minus those the base references.
 		carry := digestsReferenced(target.Entries)
-		if base != "" {
+		if haveBase {
 			for digest := range digestsReferenced(baseSnap.Entries) {
 				delete(carry, digest)
 			}
 		}
+
+		// Phase 1, no writes: verify every object the target references, reading
+		// each once through a fixed-size buffer. This includes objects the delta
+		// omits because the base references them: certifying the delta requires
+		// those to be intact too. Each object must be a regular file, its bytes
+		// must hash to the digest, and every entry referencing it must record
+		// that same byte count. Nothing is staged until all referenced objects
+		// pass, so corruption discovered only after healthy objects have been
+		// processed still fails the entire export. Digests are processed in
+		// sorted order so any failure message is deterministic.
+		carriedSizes := make(map[string]int64, len(carry))
+		verifyBuf := make([]byte, exportBufferSize)
 		for _, digest := range sortedDigests(target.Entries) {
-			content, size, err := s.readVerifiedObject(digest, target.Entries)
+			size, err := s.streamVerifyObject(digest, target.Entries, verifyBuf)
 			if err != nil {
 				return fmt.Errorf("snapshot %q references unusable object %s: %w", name, digest, err)
 			}
-			if _, included := carry[digest]; !included {
-				continue
+			if _, included := carry[digest]; included {
+				carriedSizes[digest] = size
 			}
-			pkg.Objects = append(pkg.Objects, PackageObject{
-				Digest: digest,
-				Size:   size,
-				Data:   base64.StdEncoding.EncodeToString(content),
+		}
+
+		// Phase 2: serialize the carried objects straight into the temporary
+		// package, still in digest order. The payloads are re-opened and base64
+		// encoded one object at a time through fixed-size buffers; neither the
+		// raw bytes nor the encoded string are retained. The exclusive lock held
+		// for the whole export guarantees the files reopened here are exactly
+		// the ones verified above.
+		carried := make([]string, 0, len(carry))
+		for digest := range carry {
+			carried = append(carried, digest)
+		}
+		sort.Strings(carried)
+		sources := make([]packageObjectSource, 0, len(carried))
+		for _, digest := range carried {
+			digest := digest
+			sources = append(sources, packageObjectSource{
+				digest: digest,
+				size:   carriedSizes[digest],
+				open:   func() (io.ReadCloser, error) { return s.openObjectForExport(digest) },
 			})
 		}
 
-		data, err := marshalPackage(pkg)
-		if err != nil {
+		var basePtr *Snapshot
+		if haveBase {
+			basePtr = &baseSnap
+		}
+		if err := s.writeOutputPackage(pin, absOut, mode, target, basePtr, sources); err != nil {
 			return err
 		}
-		if err := s.writeOutputPackage(pin, absOut, data, mode); err != nil {
-			return err
-		}
-		result = ExportResult{Name: name, Entries: len(target.Entries), Objects: len(pkg.Objects)}
+		result = ExportResult{Name: name, Entries: len(target.Entries), Objects: len(sources)}
 		return nil
 	})
 	if err != nil {
@@ -159,11 +191,14 @@ func (s *Store) ExportSnapshot(name, base, output string) (ExportResult, error) 
 }
 
 // writeOutputPackage stages the package as a complete temporary file inside
-// the pinned parent directory and commits it via Store.commitOutput, which
-// revalidates the destination immediately before the atomic rename. On any
-// failure the temporary file is removed and an existing output is never
-// touched.
-func (s *Store) writeOutputPackage(pin *parentPin, absOut string, data []byte, mode os.FileMode) error {
+// the pinned parent directory, streaming the carried objects into it, and
+// commits it via Store.commitOutput, which revalidates the destination
+// immediately before the atomic rename. Metadata is rendered first; each
+// object's payload is base64 encoded straight into the file through a fixed
+// buffer as it is read from the repository, so the package is never assembled
+// in memory. On any failure the temporary file is removed and an existing
+// output is never touched.
+func (s *Store) writeOutputPackage(pin *parentPin, absOut string, mode os.FileMode, target Snapshot, base *Snapshot, objects []packageObjectSource) error {
 	tmp, tmpBase, err := createTempIn(pin, ".package-")
 	if err != nil {
 		return fmt.Errorf("cannot create temporary file for output: %w", err)
@@ -178,7 +213,7 @@ func (s *Store) writeOutputPackage(pin *parentPin, absOut string, data []byte, m
 		tmp.Close()
 		return fmt.Errorf("cannot prepare output file: %w", err)
 	}
-	if _, err := tmp.Write(data); err != nil {
+	if err := writeStreamingPackage(tmp, target, base, objects); err != nil {
 		tmp.Close()
 		return fmt.Errorf("cannot write output %q: %w", absOut, err)
 	}
@@ -195,6 +230,71 @@ func (s *Store) writeOutputPackage(pin *parentPin, absOut string, data []byte, m
 	committed = true
 	_ = syncDirectory(pin.f)
 	return nil
+}
+
+// streamVerifyObject reads the content object filed under digest once through
+// the supplied fixed-size buffer, requiring it to be a regular file (never a
+// symlink or other special file) whose full bytes hash to digest, and
+// confirms the size recorded for it by every referencing entry. It is the
+// streaming counterpart of readVerifiedObject: it returns the object's true
+// byte count but never the bytes themselves, so verification memory does not
+// depend on object size. The same buffer is reused for every object, so
+// verification memory also does not grow with the object count. The error
+// wording matches readHealthyObject/readVerifiedObject so callers and tests
+// cannot distinguish the streaming path.
+func (s *Store) streamVerifyObject(digest string, entries map[string]Entry, buf []byte) (int64, error) {
+	path := s.objectPath(digest)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return 0, errors.New("object path is a symbolic link")
+	}
+	if !info.Mode().IsRegular() {
+		return 0, errors.New("object path is not a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	hash := sha256.New()
+	n, copyErr := io.CopyBuffer(hash, streamReader{file}, buf)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return 0, copyErr
+	}
+	if closeErr != nil {
+		return 0, closeErr
+	}
+	if actual := hex.EncodeToString(hash.Sum(nil)); actual != digest {
+		return 0, fmt.Errorf("content checksum is %s", actual)
+	}
+	// Every entry referencing this digest must agree on the size; a content
+	// hash fixes the byte count, so a disagreement is a corrupt record.
+	for _, entry := range entries {
+		if entry.Digest == digest && n != entry.Size {
+			return 0, fmt.Errorf("content is %d bytes, record for %q says %d", n, entry.Name, entry.Size)
+		}
+	}
+	return n, nil
+}
+
+// openObjectForExport opens a verified content object for serialization,
+// re-confirming it is a regular file and not a symlink. The caller closes it.
+func (s *Store) openObjectForExport(digest string) (io.ReadCloser, error) {
+	path := s.objectPath(digest)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("object path is a symbolic link")
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("object path is not a regular file")
+	}
+	return os.Open(path)
 }
 
 // ImportSnapshot imports a snapshot package produced by ExportSnapshot into an
