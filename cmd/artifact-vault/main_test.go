@@ -101,6 +101,106 @@ func TestPutCLIRejectsCorruptIndexSilently(t *testing.T) {
 	}
 }
 
+// TestListCLIStrictMapping applies the strict mapping precondition at the
+// command line: a healthy repository prints one name<TAB>digest<TAB>size line
+// per artifact sorted by full name (zero rows for a genuine empty mapping),
+// while a damaged index fails with an error, prints no artifact rows at all,
+// and leaves the index bytes untouched; a repository that was never
+// initialized is reported instead of listed as empty.
+func TestListCLIStrictMapping(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "vault")
+
+	// A repository that was never initialized is an error, not an empty list.
+	var listErr error
+	out := captureStdout(t, func() {
+		listErr = run([]string{"list", "--root", root})
+	})
+	if listErr == nil {
+		t.Fatal("expected list of an uninitialized repository to fail")
+	}
+	if !strings.Contains(listErr.Error(), "not initialized") {
+		t.Fatalf("error %q does not report the repository as uninitialized", listErr)
+	}
+	if out != "" {
+		t.Fatalf("uninitialized repository printed rows: %q", out)
+	}
+
+	if err := run([]string{"init", "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+	// A genuine {"entries":{}} lists successfully with no rows.
+	out = captureStdout(t, func() {
+		if err := run([]string{"list", "--root", root}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if out != "" {
+		t.Fatalf("empty mapping printed rows: %q", out)
+	}
+
+	in := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(in, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", root, "--name", "z/up.bin", "--file", in}); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(t.TempDir(), "empty.bin")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"put", "--root", root, "--name", "a/down.bin", "--file", empty}); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() {
+		if err := run([]string{"list", "--root", root}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected two rows, got %q", out)
+	}
+	if !strings.HasPrefix(lines[0], "a/down.bin\t") ||
+		!strings.HasSuffix(lines[0], "\t0") {
+		t.Fatalf("zero-byte row not first and tab-formatted: %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "z/up.bin\t") {
+		t.Fatalf("second row not the multi-level name: %q", lines[1])
+	}
+
+	// Damage the mapping with a duplicate artifact name: the whole command
+	// fails and not a single row reaches stdout.
+	indexPath := filepath.Join(root, "index.json")
+	corrupt := []byte(`{"entries":{` +
+		`"z/up.bin":{"name":"z/up.bin","digest":"` + strings.Repeat("a", 64) + `","size":7,"createdAt":"2026-01-01T00:00:00Z"},` +
+		`"z/up.bin":{"name":"z/up.bin","digest":"` + strings.Repeat("a", 64) + `","size":7,"createdAt":"2026-01-01T00:00:00Z"}` +
+		`}}`)
+	if err := os.WriteFile(indexPath, corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() {
+		listErr = run([]string{"list", "--root", root})
+	})
+	if listErr == nil {
+		t.Fatal("expected list over a corrupt index to fail")
+	}
+	if !strings.Contains(listErr.Error(), "current index is corrupt") ||
+		!strings.Contains(listErr.Error(), `duplicate key "z/up.bin"`) {
+		t.Fatalf("error %q does not name the corrupt index and duplicated key", listErr)
+	}
+	if out != "" {
+		t.Fatalf("failed list must print no artifact rows, got %q", out)
+	}
+	after, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(corrupt) {
+		t.Fatalf("corrupt index was rewritten\nwas: %s\nnow: %s", corrupt, after)
+	}
+}
+
 // TestSnapshotCreateCLIRejectsCorruptIndex applies the same rules at the
 // command line as the Go API: a healthy create keeps its existing success
 // line, while an unusable current mapping fails with an error naming the

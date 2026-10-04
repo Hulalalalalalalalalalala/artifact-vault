@@ -190,6 +190,34 @@ func (s *Store) loadStrict() (index, error) {
 	return idx, nil
 }
 
+// loadStrictValidEntries loads the current mapping under loadStrict and then
+// validates every record before returning it: the document must be one
+// complete JSON object with an explicitly present entries mapping (a true
+// {"entries":{}} is a legitimate empty repository), hold no duplicate key at
+// any level (including a name written directly and again through Unicode
+// escapes), and every record must pass validateEntryRecord. Records are
+// checked in sorted name order so the first bad record reported is
+// deterministic. One bad record fails the whole load; the caller never gets a
+// partial mapping. This is the single gate list, put, get, verify, gc, and
+// snapshot creation read the current mapping through.
+func (s *Store) loadStrictValidEntries() (index, error) {
+	idx, err := s.loadStrict()
+	if err != nil {
+		return index{}, err
+	}
+	keys := make([]string, 0, len(idx.Entries))
+	for key := range idx.Entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := validateEntryRecord(key, idx.Entries[key]); err != nil {
+			return index{}, fmt.Errorf("current index is corrupt: %w", err)
+		}
+	}
+	return idx, nil
+}
+
 // validateEntryRecord checks one index or snapshot entry the same way
 // restore validates snapshot entries: the map key must equal the recorded
 // name, the name must be legal, the digest must be 64 lowercase hex

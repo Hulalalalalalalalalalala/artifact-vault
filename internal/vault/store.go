@@ -255,40 +255,59 @@ func checkReusableObject(info os.FileInfo, object, digest string, size int64) er
 // read"), which keeps it distinct from a failure to read the upload's input
 // file and from a damaged existing content object.
 func (s *Store) loadIndexForUpload(uploadName string) (index, error) {
-	idx, err := s.loadStrict()
+	idx, err := s.loadStrictValidEntries()
 	if err != nil {
 		return index{}, fmt.Errorf("cannot store %q: %w", uploadName, err)
-	}
-	keys := make([]string, 0, len(idx.Entries))
-	for key := range idx.Entries {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		if err := validateEntryRecord(key, idx.Entries[key]); err != nil {
-			return index{}, fmt.Errorf("cannot store %q: current index is corrupt: %w", uploadName, err)
-		}
 	}
 	return idx, nil
 }
 
+// List returns the artifacts recorded in the current name mapping, sorted by
+// the complete artifact name. Artifact rows are returned only after the whole
+// current mapping proves complete, unambiguous, and legal: it is loaded with
+// the same strict rules upload, verify, gc, and snapshot creation apply (one
+// complete JSON object with an explicitly present, object-valued entries
+// mapping — a genuine {"entries":{}} is a healthy empty repository and lists
+// zero rows; a bare null, an empty {}, a missing or null entries field, a
+// non-object entries value, a truncated document, trailing content, or any
+// duplicate key at any level, including a name written directly and again
+// through Unicode escapes, is corruption), and every record must be keyed by
+// its recorded name with a legal name, a 64-character lowercase-hex digest,
+// and a non-negative size. A single bad record fails the whole listing even
+// when every other record is healthy; no partial set of names is returned and
+// the bad record is never skipped.
+//
+// On failure List returns nil and an error: "current index is corrupt: …"
+// (naming the duplicated key or the offending mapping name) when the bytes are
+// damaged, "current index cannot be read: …" when they cannot be read, and a
+// not-initialized error when the repository or its index.json does not exist,
+// which is never reported as an empty list. List reads only the current
+// mapping: it never reads or verifies content objects and never reads
+// snapshots, so a missing or damaged object or a damaged snapshot does not
+// stop the legal current records from showing. List never rewrites the index,
+// snapshots, or objects. The lock is shared, so lists run alongside downloads
+// and verifies.
 func (s *Store) List() ([]Entry, error) {
-	var entries []Entry
-	err := s.withLock(false, func() error {
-		idx, err := s.load()
+	entries := []Entry{}
+	err := s.withLockOpts(false, false, func() error {
+		idx, err := s.loadStrictValidEntries()
 		if err != nil {
 			return err
 		}
-		entries = make([]Entry, 0, len(idx.Entries))
-		for _, entry := range idx.Entries {
-			entries = append(entries, entry)
+		keys := make([]string, 0, len(idx.Entries))
+		for key := range idx.Entries {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		entries = make([]Entry, 0, len(keys))
+		for _, key := range keys {
+			entries = append(entries, idx.Entries[key])
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return entries, nil
 }
 
@@ -320,15 +339,12 @@ func (s *Store) List() ([]Entry, error) {
 func (s *Store) Verify() (int, error) {
 	count := 0
 	err := s.withLock(false, func() error {
-		idx, err := s.loadStrict()
+		idx, err := s.loadStrictValidEntries()
 		if err != nil {
 			return err
 		}
 		entries := make([]Entry, 0, len(idx.Entries))
-		for key, entry := range idx.Entries {
-			if err := validateEntryRecord(key, entry); err != nil {
-				return fmt.Errorf("current index is corrupt: %w", err)
-			}
+		for _, entry := range idx.Entries {
 			entries = append(entries, entry)
 		}
 		// Sort by name so the first reported failure is deterministic.
@@ -364,21 +380,6 @@ func (s *Store) verifyObject(entry Entry) error {
 		return errors.New("content mismatch")
 	}
 	return nil
-}
-
-func (s *Store) load() (index, error) {
-	data, err := os.ReadFile(s.indexPath())
-	if err != nil {
-		return index{}, err
-	}
-	var idx index
-	if err := json.Unmarshal(data, &idx); err != nil {
-		return index{}, err
-	}
-	if idx.Entries == nil {
-		idx.Entries = map[string]Entry{}
-	}
-	return idx, nil
 }
 
 func (s *Store) save(idx index) error {
