@@ -97,8 +97,10 @@ func (s *Store) CreateSnapshot(name string) (Snapshot, error) {
 // validated exactly the way RestoreSnapshot validates the record it restores
 // (see decodeSnapshotRecord) — a single JSON object whose recorded name
 // equals its filing name in full ("releases/stable", never just "stable"),
-// with a present, object-valued entries mapping ({} is a legitimate empty
-// snapshot; a missing or null entries field is corruption) containing only
+// with a present, object-valued entries mapping spelled exactly "entries"
+// ({} is a legitimate empty snapshot; a missing or null entries field is
+// corruption, and so is any case-variant spelling such as "Entries", alone
+// or beside the standard field) containing only
 // valid artifact records. The content objects the entries reference are not
 // read or checked; listing depends on neither the objects nor the health of
 // the current name mapping.
@@ -209,9 +211,10 @@ func (s *Store) walkSnapshotRecords(fn func(name string, snap Snapshot) error) e
 // record must be a complete, well-formed document whose recorded name equals
 // the selected snapshot name in full (a record nested under "releases/stable"
 // must itself say "releases/stable", never just "stable") and whose entries
-// mapping is present and an object ({} is a legitimate empty snapshot; a
-// missing, null, or non-object entries field is corruption, never an empty
-// mapping). Every referenced object is checked for existence, size, and
+// mapping is present, spelled exactly "entries" (any case-variant spelling
+// such as "Entries" is corruption, alone or beside the standard field), and
+// an object ({} is a legitimate empty snapshot; a missing, null, or
+// non-object entries field is corruption, never an empty mapping). Every referenced object is checked for existence, size, and
 // SHA-256 before the mapping is swapped; any failure leaves the current
 // mapping's bytes and all snapshots and objects untouched, even when the
 // current mapping itself is already corrupted.
@@ -246,9 +249,20 @@ func (s *Store) RestoreSnapshot(name string) error {
 //   - "name": present and a string equal to wantName, including every level of
 //     a multi-level name; a missing, wrong-type, or merely-suffixed name
 //     (record "stable" under "releases/stable") is refused;
-//   - "entries": present and a JSON object. {} is a legitimate empty mapping;
-//     a missing field, a null, an array, or any non-object value is
-//     corruption rather than zero entries.
+//   - "entries": present, spelled exactly "entries", and a JSON object. {} is
+//     a legitimate empty mapping; a missing field, a null, an array, or any
+//     non-object value is corruption rather than zero entries. A field whose
+//     decoded name matches "entries" only case-insensitively ("Entries",
+//     "ENTRIES", ...) is corruption whether it appears alone or beside the
+//     standard field, in either order, with identical or different content,
+//     empty or not: encoding/json binds struct fields case-insensitively, so
+//     without the check the variant would silently populate the mapping — and
+//     when both spellings appear, whichever came last would silently replace
+//     the other, dropping artifact references or installing an empty mapping.
+//     Field names are compared after JSON string decoding, so "entries"
+//     written through Unicode escapes stays valid while an escape decoding to
+//     a case variant is rejected. The rule applies only to the top-level
+//     mapping field; artifact names remain case-sensitive.
 //
 // Every entry is then checked with validateEntryRecord. The errors
 // distinguish a missing entries mapping, a mismatching recorded name, and a
@@ -278,6 +292,14 @@ func decodeSnapshotRecord(data []byte, wantName string) (Snapshot, error) {
 			return Snapshot{}, fmt.Errorf("malformed record: unexpected trailing content after the snapshot object (%v)", tok)
 		}
 		return Snapshot{}, fmt.Errorf("malformed record: %w", err)
+	}
+	// A field that spells the entries mapping with different casing
+	// ("Entries", "ENTRIES", ...) would be silently bound to it by
+	// encoding/json — and would silently overwrite or be overwritten by the
+	// standard spelling when both appear — so any such field is corruption,
+	// regardless of order, content, or emptiness.
+	if err := rejectEntriesCaseVariants(data); err != nil {
+		return Snapshot{}, err
 	}
 	if raw.Name == nil {
 		return Snapshot{}, errors.New("malformed record: missing snapshot name")

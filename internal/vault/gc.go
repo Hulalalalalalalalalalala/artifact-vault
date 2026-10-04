@@ -209,13 +209,13 @@ func (s *Store) loadStrict() (index, error) {
 	return idx, nil
 }
 
-// rejectEntriesCaseVariants inspects the top-level field names of the index
-// document and refuses any field whose decoded name matches "entries" only
-// case-insensitively. encoding/json binds struct fields case-insensitively,
-// so without this check an "Entries" field would silently populate the
-// mapping on its own, and a document carrying both spellings would keep
-// only whichever came last — dropping artifact records or replacing them
-// with an empty mapping. Names are compared after JSON string decoding:
+// rejectEntriesCaseVariants inspects the top-level field names of an index or
+// snapshot document and refuses any field whose decoded name matches "entries"
+// only case-insensitively. encoding/json binds struct fields
+// case-insensitively, so without this check an "Entries" field would silently
+// populate the mapping on its own, and a document carrying both spellings
+// would keep only whichever came last — dropping artifact records or replacing
+// them with an empty mapping. Names are compared after JSON string decoding:
 // "entries" written through Unicode escapes is the standard field and stays
 // valid, while an escape decoding to a case variant is rejected. Duplicate
 // exact keys were already rejected by rejectDuplicateKeys, so decoding the
