@@ -28,6 +28,49 @@ FINGERPRINT=$(fingerprint_of "$FIXTURES/valid.der")
 EXPIRED_FINGERPRINT=$(fingerprint_of "$FIXTURES/expired.der")
 MARKER_FINGERPRINT=$(fingerprint_of "$FIXTURES/marker.der")
 NAMES_FINGERPRINT=$(fingerprint_of "$FIXTURES/names.der")
+LONG_OID_FINGERPRINT=$(fingerprint_of "$FIXTURES/long_oid.der")
+
+# Concatenate $1 exactly $2 times (used to spell out the long dotted OIDs,
+# which are regular repeated-arc sequences far too long to paste by hand).
+repeat() {
+    token=$1
+    count=$2
+    i=0
+    result=''
+    while [ "$i" -lt "$count" ]; do
+        result="$result$token"
+        i=$((i + 1))
+    done
+    printf '%s' "$result"
+}
+
+# Unknown OIDs carried by tests/fixtures/long_oid.{pem,der}. Their dotted text
+# lengths straddle the old 79-character fixed-buffer boundary:
+#   OID79:  exactly 79 chars (fills the old buffer without truncating);
+#   OID80:  exactly 80 chars (first one that used to lose its last arc);
+#   PA/PB:  two 81-char OIDs whose FIRST 79 characters are byte-identical;
+#           they diverge only in the final arc ("10" vs "20") and must never
+#           be rendered as the same attribute name;
+#   OLONG:  189 chars (multi-digit arcs keep it legal in DER);
+#   PREFIX: their shared 79-char prefix, ending in '.'; truncation would show
+#           this prefix followed directly by '='.
+OID79="1.2$(repeat '.1' 38)"
+OID80="1.2.10$(repeat '.1' 37)"
+PA_PREFIX="1.2.10$(repeat '.1' 36)."
+OID_PA="${PA_PREFIX}10"
+OID_PB="${PA_PREFIX}20"
+OID_LONG="1.2$(repeat '.39' 62)"
+[ "${#OID79}" -eq 79 ] || fail_helper=oid79
+[ "${#OID80}" -eq 80 ] || fail_helper=oid80
+[ "${#OID_PA}" -eq 81 ] && [ "${#OID_PB}" -eq 81 ] || fail_helper=pair
+[ "$OID_PA" != "$OID_PB" ] || fail_helper=pair_distinct
+[ "${#OID_LONG}" -eq 189 ] || fail_helper=olong
+[ "$(printf '%s' "$OID_PA" | cut -c1-79)" = "$(printf '%s' "$OID_PB" | cut -c1-79)" ] ||
+    fail_helper=prefix
+if [ -n "${fail_helper:-}" ]; then
+    echo "FAIL: internal OID test constant mismatch ($fail_helper)" >&2
+    exit 1
+fi
 
 VALID_SUBJECT='C=CN, O=Trustpeek Test Org, OU=Engineering, CN=valid.example.test'
 EXPIRED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=expired.example.test'
@@ -45,6 +88,14 @@ MARKER_SUBJECT='C=CN, O=Trustpeek Test Org, CN=marker -----BEGIN CERTIFICATE----
 #   - Chinese and other non-ASCII text stays as UTF-8.
 NAMES_SUBJECT='C=CN, O=信任网络科技（北京）有限公司, CN=a\+b\,c\\d+OU=平台\+事业群, OU=安全组, title=Köln/München 工程部, CN=\ 终端用户证书\ '
 NAMES_ISSUER='C=CN, O=示例科技有限公司, OU=研发部, OU=质量\,组\+A\\B, L=上海+ST=上海\+市\,测试, 1.2.3.4.5.6.7=未知属性值, CN=\ 颁发\,者\+根\\CA\ '
+
+# Subject and issuer of the long-unknown-OID certificate
+# (tests/fixtures/long_oid.{pem,der}). Every dotted OID must appear in full,
+# each followed by its own value; escapes inside values and the "+' grouping
+# are identical in meaning to the complex-name fixture. Built from the OID
+# constants above so the enormous keys never have to be typed out.
+LONG_SUBJECT="C=CN, OU=研发部, ${OID79}=长度79的OID值, ${OID80}=长度80的OID值\,含逗号\+加号\\\\反斜杠, CN=组内CN+${OID_PA}=配对A值, ${OID_PB}=配对B值, 1.2.3.4.5.6.7=短未知OID, ${OID_LONG}=\ 超长OID值\ , CN=结尾CN"
+LONG_ISSUER="C=CN, O=长OID颁发机构, ${OID_LONG}=颁发者长OID, ${OID_PA}=颁发者配对A, CN=Long OID Root CA"
 
 write_expected_valid() {  # $1 = encoding, $2 = output file
     {
@@ -80,6 +131,87 @@ write_expected_names() {  # $1 = encoding, $2 = output file
         printf 'SHA-256 Fingerprint: %s\n' "$NAMES_FINGERPRINT"
         printf '%s\n' "$NOTE"
     } >"$2"
+}
+
+write_expected_long_oid() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$LONG_SUBJECT"
+        printf 'Issuer: %s\n' "$LONG_ISSUER"
+        printf 'Not Before: 2023-01-01T00:00:00Z\n'
+        printf 'Not After: 2043-01-01T00:00:00Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$LONG_OID_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+# Structural guards for the long-OID output ($1 = captured stdout file).
+# The byte-for-byte expected comparison already pins everything; these checks
+# independently re-prove the specific truncation hazards the fixture exists
+# for, by name rather than by raw diff.
+assert_long_oid_structure() {
+    out=$1
+    subject=$(sed -n 's/^Subject: //p' "$out")
+    issuer=$(sed -n 's/^Issuer: //p' "$out")
+
+    [ "$subject" != "$issuer" ] ||
+        fail "subject and issuer must render different names"
+    [ "$subject" = "$LONG_SUBJECT" ] ||
+        fail "long-OID subject rendered incompletely or reordered"
+    [ "$issuer" = "$LONG_ISSUER" ] ||
+        fail "long-OID issuer rendered incompletely or reordered"
+
+    # Each long OID must appear followed directly by '=' and by its OWN value,
+    # proving no trailing arc was dropped and no attribute was swallowed.
+    for pair in "${OID79}=长度79的OID值" \
+                "${OID80}=长度80的OID值" \
+                "${OID_PA}=配对A值" "${OID_PB}=配对B值" \
+                "${OID_LONG}=颁发者长OID" \
+                "1.2.3.4.5.6.7=短未知OID" \
+                "CN=结尾CN" "OU=研发部"; do
+        case "$subject $issuer" in
+            *"$pair"*) ;;
+            *) fail "missing or truncated OID/value pair: ${pair%%=*}" ;;
+        esac
+    done
+
+    # The 189-char OID must survive whole in BOTH names (subject and issuer
+    # carry it with different values).
+    [ "$(printf '%s' "$subject$issuer" | grep -oF "$OID_LONG" | wc -l)" -eq 2 ] ||
+        fail "189-char OID must appear in full in subject and issuer"
+
+    # Two OIDs sharing their first 79 chars must render as DISTINCT names:
+    # each full OID present, neither collapsed into the shared prefix+'='.
+    case "$subject" in
+        *"${OID_PA}=配对A值"*"${OID_PB}=配对B值"*) ;;
+        *) fail "prefix-sharing OIDs must keep distinct names and values" ;;
+    esac
+    case "$subject" in
+        *"${PA_PREFIX}="*) fail "OID was truncated at 79 chars (dangling '.')" ;;
+        *) ;;
+    esac
+
+    # Known short names keep working alongside the long dotted OIDs, and the
+    # multi-valued RDN still joins with a bare '+'.
+    case "$subject" in
+        *"CN=组内CN+${OID_PA}=配对A值"*) ;;
+        *) fail "multi-valued RDN grouping with long OID broken" ;;
+    esac
+
+    # Escaped punctuation inside a value whose key is very long must still be
+    # escaped exactly once, and leading/trailing spaces as '\ '. The expected
+    # substrings are held in single-quoted variables (literal backslashes) and
+    # quoted again inside the pattern so glob escaping cannot interfere.
+    esc_punct='长度80的OID值\,含逗号\+加号\\反斜杠'
+    esc_spaces=", ${OID_LONG}=\\ 超长OID值\\ "
+    case "$subject" in
+        *"$esc_punct"*) ;;
+        *) fail "escapes lost next to a long OID key" ;;
+    esac
+    case "$subject" in
+        *"$esc_spaces"*) ;;
+        *) fail "leading/trailing spaces not preserved for long OID value" ;;
+    esac
 }
 
 # Structural guards for the complex-name output ($1 = captured stdout file).
@@ -364,6 +496,49 @@ case "$CASE" in
         pem_issuer=$(sed -n 's/^Issuer: //p' "$TMP/pem.out")
         [ "$pem_subject" != "$pem_issuer" ] ||
             fail "names fixture must have different subject and issuer"
+        ;;
+
+    der_long_oid)
+        # Unknown dotted OIDs at 79/80/81/189 chars, including two that share
+        # their first 79 chars: every OID and value rendered in full, exit 0,
+        # empty stderr.
+        write_expected_long_oid DER "$TMP/expected"
+        expect_success "$FIXTURES/long_oid.der" "$TMP/expected"
+        assert_long_oid_structure "$TMP/expected"
+        ;;
+
+    pem_long_oid)
+        # The same certificate as PEM: reported as PEM while both long-OID
+        # name lines stay byte-for-byte identical to the DER rendering.
+        write_expected_long_oid PEM "$TMP/expected"
+        expect_success "$FIXTURES/long_oid.pem" "$TMP/expected"
+        assert_long_oid_structure "$TMP/expected"
+        ;;
+
+    pem_der_long_oid_same)
+        # PEM vs DER of one certificate: Encoding reports the real format and
+        # everything else (long OIDs, values, fingerprint) agrees verbatim.
+        "$BIN" inspect "$FIXTURES/long_oid.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/long_oid.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree on the long-OID name fields"
+        assert_long_oid_structure "$TMP/der.out"
+        pem_subject=$(sed -n 's/^Subject: //p' "$TMP/pem.out")
+        pem_issuer=$(sed -n 's/^Issuer: //p' "$TMP/pem.out")
+        [ "$pem_subject" != "$pem_issuer" ] ||
+            fail "long-OID fixture must have different subject and issuer"
         ;;
 
     empty_file)

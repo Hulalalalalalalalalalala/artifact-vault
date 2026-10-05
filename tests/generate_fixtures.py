@@ -22,6 +22,23 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 # form instead of dropping the attribute.
 CUSTOM_NAME_OID = ObjectIdentifier("1.2.3.4.5.6.7")
 
+# Unknown OIDs long enough to overflow any fixed textual buffer. Dotted text
+# length (not the DER encoding) is what matters here: OBJ_obj2txt used to be
+# handed an 80-byte buffer and silently truncated at 79 characters. The DER
+# content of an OID is capped around 63 bytes, but multi-digit arcs still cost
+# one content byte each while adding three text characters, so 189-char dotted
+# names remain perfectly legal.
+#
+# Exact boundary lengths 79 and 80, a 189-char "very long" OID, and two OIDs
+# whose first 79 characters are byte-identical and which diverge only in a
+# later arc are all exercised so truncation can never merge two attributes.
+OID_NAME_79 = ObjectIdentifier("1.2" + ".1" * 38)          # 79 chars
+OID_NAME_80 = ObjectIdentifier("1.2.10" + ".1" * 37)       # 80 chars
+_OID_PREFIX_79 = "1.2.10" + ".1" * 36 + "."                # 79 chars, '.' last
+OID_NAME_PAIR_A = ObjectIdentifier(_OID_PREFIX_79 + "10")  # 81 chars
+OID_NAME_PAIR_B = ObjectIdentifier(_OID_PREFIX_79 + "20")  # 81 chars, differs late
+OID_NAME_LONG = ObjectIdentifier("1.2" + ".39" * 62)       # 189 chars
+
 
 def rdn(oid, value):
     return x509.RelativeDistinguishedName(
@@ -198,6 +215,68 @@ def main():
     )
     (FIXTURES / "names.pem").write_bytes(
         complex_cert.public_bytes(serialization.Encoding.PEM)
+    )
+
+    # A certificate whose subject and issuer carry unknown dotted OIDs at and
+    # beyond the old 79-character truncation boundary. Every long OID must be
+    # shown in full, next to its own value:
+    #   - OIDs of exactly 79 and 80 text characters (the boundary);
+    #   - two 81-char OIDs sharing the first 79 chars, differing only in the
+    #     last arc (one grouped with CN via "+", the other a standalone RDN);
+    #   - a 189-char OID;
+    #   - a short unknown OID alongside the long ones;
+    #   - known short names C/OU/CN mixed in, repeated CN, Chinese values and
+    #     escaped ",", "+" and "\\" so lengthening the name cannot shift the
+    #     boundaries between neighbouring attributes.
+    # Subject and issuer are different so each name is rendered separately.
+    long_subject = x509.Name(
+        [
+            rdn(NameOID.COUNTRY_NAME, "CN"),
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, "研发部"),
+            rdn(OID_NAME_79, "长度79的OID值"),
+            rdn(OID_NAME_80, "长度80的OID值,含逗号+加号\\反斜杠"),
+            x509.RelativeDistinguishedName(
+                [
+                    x509.NameAttribute(OID_NAME_PAIR_A, "配对A值"),
+                    x509.NameAttribute(NameOID.COMMON_NAME, "组内CN"),
+                ]
+            ),
+            rdn(OID_NAME_PAIR_B, "配对B值"),
+            rdn(CUSTOM_NAME_OID, "短未知OID"),
+            rdn(OID_NAME_LONG, " 超长OID值 "),
+            rdn(NameOID.COMMON_NAME, "结尾CN"),
+        ]
+    )
+    long_issuer = x509.Name(
+        [
+            rdn(NameOID.COUNTRY_NAME, "CN"),
+            rdn(NameOID.ORGANIZATION_NAME, "长OID颁发机构"),
+            rdn(OID_NAME_LONG, "颁发者长OID"),
+            rdn(OID_NAME_PAIR_A, "颁发者配对A"),
+            rdn(NameOID.COMMON_NAME, "Long OID Root CA"),
+        ]
+    )
+    long_subject_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    long_issuer_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    long_cert = (
+        x509.CertificateBuilder()
+        .subject_name(long_subject)
+        .issuer_name(long_issuer)
+        .public_key(long_subject_key.public_key())
+        .serial_number(0x3001)
+        .not_valid_before(datetime.datetime(2023, 1, 1, tzinfo=utc))
+        .not_valid_after(datetime.datetime(2043, 1, 1, tzinfo=utc))
+        .sign(long_issuer_key, hashes.SHA256())
+    )
+    (FIXTURES / "long_oid.der").write_bytes(
+        long_cert.public_bytes(serialization.Encoding.DER)
+    )
+    (FIXTURES / "long_oid.pem").write_bytes(
+        long_cert.public_bytes(serialization.Encoding.PEM)
     )
 
 

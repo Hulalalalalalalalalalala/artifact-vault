@@ -216,6 +216,21 @@ std::string escape_dn_value(const std::string& value) {
     return out;
 }
 
+// Renders an OID without a known short name as its full dotted-decimal text.
+// OBJ_obj2txt truncates when the destination is too small (it returns the
+// would-be length, not an error), so the size is learned with a sizing call
+// first and the text is written into an exactly-sized std::string. This keeps
+// arbitrarily long OIDs intact instead of silently dropping trailing arcs.
+bool dotted_oid_text(ASN1_OBJECT* object, std::string& out) {
+    int length = OBJ_obj2txt(nullptr, 0, object, 1);
+    if (length <= 0) return false;
+    std::string text(static_cast<size_t>(length), '\0');
+    int written = OBJ_obj2txt(text.data(), length + 1, object, 1);
+    if (written != length) return false;
+    out = std::move(text);
+    return true;
+}
+
 bool format_name(X509_NAME* name, std::string& out) {
     int count = X509_NAME_entry_count(name);
     int previous_set = -1;
@@ -226,15 +241,14 @@ bool format_name(X509_NAME* name, std::string& out) {
         ASN1_STRING* asn1_value = X509_NAME_ENTRY_get_data(entry);
         if (object == nullptr || asn1_value == nullptr) return false;
 
-        const char* short_name = nullptr;
-        char oid_buffer[80];
+        std::string attribute_name;
         int nid = OBJ_obj2nid(object);
-        if (nid != NID_undef) short_name = OBJ_nid2sn(nid);
-        if (short_name == nullptr) {
-            if (OBJ_obj2txt(oid_buffer, sizeof(oid_buffer), object, 1) <= 0) {
-                return false;
-            }
-            short_name = oid_buffer;
+        if (nid != NID_undef) {
+            const char* short_name = OBJ_nid2sn(nid);
+            if (short_name != nullptr) attribute_name = short_name;
+        }
+        if (attribute_name.empty()) {
+            if (!dotted_oid_text(object, attribute_name)) return false;
         }
 
         unsigned char* utf8_raw = nullptr;
@@ -250,7 +264,7 @@ bool format_name(X509_NAME* name, std::string& out) {
         if (i > 0) {
             out.append(current_set == previous_set ? "+" : ", ");
         }
-        out.append(short_name);
+        out.append(attribute_name);
         out.push_back('=');
         out.append(escape_dn_value(value));
         previous_set = current_set;

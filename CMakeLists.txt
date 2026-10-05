@@ -24,6 +24,9 @@ if(BUILD_TESTING)
         der_complex_names
         pem_complex_names
         pem_der_complex_names_same
+        der_long_oid
+        pem_long_oid
+        pem_der_long_oid_same
         der_marker_trailing_newline
         der_marker_trailing_pem_block
         pem_marker_second_block
