@@ -21,6 +21,9 @@ if(BUILD_TESTING)
         self_signed_ok
         der_marker_in_name
         pem_marker_in_name
+        der_complex_names
+        pem_complex_names
+        pem_der_complex_names_same
         der_marker_trailing_newline
         der_marker_trailing_pem_block
         pem_marker_second_block
