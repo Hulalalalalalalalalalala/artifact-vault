@@ -6,12 +6,14 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -292,21 +294,93 @@ std::string format_fingerprint(const unsigned char* digest, size_t length) {
     return out;
 }
 
-int inspect_file(const std::string& path) {
+// Reads the whole file into `content`. Success requires the complete input
+// to be read with a clean end-of-file: an open error, an I/O error midway
+// (including a directory passed as the certificate path), or a close error
+// all fail the call. On failure a "failed to read file" diagnostic naming
+// `path` is emitted, `content` is left untouched and no partial bytes are
+// exposed to certificate parsing.
+bool read_file_entirely(const std::string& path, std::string& content) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) {
+        // Opening a directory succeeds on Linux, so detect it explicitly
+        // instead of letting the empty/failed read masquerade as a
+        // malformed certificate.
+        std::cerr << "trustpeek: failed to read file '" << path
+                  << "': path is a directory, not a certificate file\n";
+        return false;
+    }
+
+    errno = 0;
     std::ifstream stream(path, std::ios::binary);
     if (!stream) {
-        std::cerr << "trustpeek: failed to read file '" << path
-                  << "': " << std::strerror(errno) << '\n';
+        std::cerr << "trustpeek: failed to read file '" << path << "': ";
+        if (errno != 0) {
+            std::cerr << std::strerror(errno);
+        } else {
+            std::cerr << "could not open file";
+        }
+        std::cerr << '\n';
+        return false;
+    }
+
+    constexpr size_t kChunkSize = 64 * 1024;
+    std::vector<char> chunk(kChunkSize);
+    std::string buffer;
+    while (true) {
+        errno = 0;
+        stream.read(chunk.data(), static_cast<std::streamsize>(kChunkSize));
+        const std::streamsize got = stream.gcount();
+        if (got > 0) buffer.append(chunk.data(), static_cast<size_t>(got));
+        if (stream.bad()) {
+            // Unlike operator<< on rdbuf, a binary read() sets badbit when
+            // the underlying read(2) fails (e.g. EISDIR, EIO). Abort at once:
+            // a partial read must never reach certificate parsing, even if
+            // the bytes read so far happen to form a parseable certificate.
+            std::cerr << "trustpeek: failed to read file '" << path << "': ";
+            if (errno != 0) {
+                std::cerr << std::strerror(errno);
+            } else {
+                // errno is not guaranteed to survive the streams layer;
+                // never report an empty reason or a stale "Success".
+                std::cerr << "I/O error while reading file contents";
+            }
+            std::cerr << '\n';
+            return false;
+        }
+        if (stream.eof()) break;
+        if (stream.fail()) {
+            std::cerr << "trustpeek: failed to read file '" << path
+                      << "': I/O error before reaching end of file\n";
+            return false;
+        }
+    }
+
+    // The final short read sets failbit alongside eofbit; clear that state
+    // so the post-close check reflects the close itself, not the EOF stop.
+    stream.clear();
+    errno = 0;
+    stream.close();
+    if (!stream) {
+        std::cerr << "trustpeek: failed to read file '" << path << "': ";
+        if (errno != 0) {
+            std::cerr << std::strerror(errno);
+        } else {
+            std::cerr << "I/O error while closing file";
+        }
+        std::cerr << '\n';
+        return false;
+    }
+
+    content = std::move(buffer);
+    return true;
+}
+
+int inspect_file(const std::string& path) {
+    std::string content;
+    if (!read_file_entirely(path, content)) {
         return 1;
     }
-    std::ostringstream contents;
-    contents << stream.rdbuf();
-    if (stream.bad()) {
-        std::cerr << "trustpeek: failed to read file '" << path
-                  << "': " << std::strerror(errno) << '\n';
-        return 1;
-    }
-    std::string content = contents.str();
 
     if (content.empty()) {
         std::cerr << "trustpeek: invalid certificate in '" << path

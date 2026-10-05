@@ -178,6 +178,27 @@ expect_invalid() {
         fail "stderr should name the input path '$file', got: $(cat "$TMP/stderr")"
 }
 
+# Run `trustpeek inspect $1` and require exit 1, empty stdout, and a stderr
+# diagnostic that reports a READ failure (never a certificate format error)
+# and names the path the user actually passed.
+expect_read_failure() {
+    file=$1
+    "$BIN" inspect "$file" >"$TMP/stdout" 2>"$TMP/stderr"
+    rc=$?
+    [ "$rc" -eq 1 ] || fail "expected exit 1, got $rc"
+    [ -s "$TMP/stdout" ] && fail "stdout must be empty on read failure, got: $(cat "$TMP/stdout")"
+    grep -q "failed to read file" "$TMP/stderr" ||
+        fail "stderr should report a read failure, got: $(cat "$TMP/stderr")"
+    grep -qF "$file" "$TMP/stderr" ||
+        fail "stderr should name the input path '$file', got: $(cat "$TMP/stderr")"
+    if grep -q "invalid certificate" "$TMP/stderr"; then
+        fail "a read failure must not be classified as a certificate format error: $(cat "$TMP/stderr")"
+    fi
+    if grep -q ': Success$' "$TMP/stderr"; then
+        fail "read failure reason must not be 'Success': $(cat "$TMP/stderr")"
+    fi
+}
+
 case "$CASE" in
     pem_basic)
         write_expected_valid PEM "$TMP/expected"
@@ -398,6 +419,36 @@ case "$CASE" in
 
     private_key_only)
         expect_invalid "$FIXTURES/private_key.pem"
+        ;;
+
+    directory_input)
+        # A directory passed where a certificate file is expected must be
+        # diagnosed as a read failure, never as an empty/invalid certificate.
+        mkdir -p "$TMP/adir"
+        expect_read_failure "$TMP/adir"
+        grep -q 'directory' "$TMP/stderr" ||
+            fail "stderr should explain that the path is a directory, got: $(cat "$TMP/stderr")"
+        ;;
+
+    directory_input_spaces_unicode)
+        # The directory diagnostic must name exactly what the user typed,
+        # including spaces and non-ASCII segments.
+        mkdir -p "$TMP/dir with space/证书目录"
+        expect_read_failure "$TMP/dir with space/证书目录"
+        ;;
+
+    missing_file)
+        expect_read_failure "$TMP/does-not-exist.pem"
+        ;;
+
+    unreadable_file)
+        # Permission problems are read failures. Root bypasses file mode
+        # bits, so only assert this when running unprivileged.
+        if [ "$(id -u)" -ne 0 ]; then
+            cp "$FIXTURES/valid.pem" "$TMP/noperm.pem"
+            chmod 000 "$TMP/noperm.pem"
+            expect_read_failure "$TMP/noperm.pem"
+        fi
         ;;
 
     *)

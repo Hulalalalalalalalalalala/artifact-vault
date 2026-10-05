@@ -39,6 +39,10 @@ if(BUILD_TESTING)
         der_trailing_bytes
         public_key_only
         private_key_only
+        directory_input
+        directory_input_spaces_unicode
+        missing_file
+        unreadable_file
     )
     foreach(case IN LISTS TRUSTPEEK_CASES)
         add_test(
