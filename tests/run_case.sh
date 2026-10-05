@@ -13,8 +13,29 @@ BIN=$1
 FIXTURES=$2
 CASE=$3
 
+# Symlink targets resolve relative to the link's own directory, so keep the
+# fixtures path absolute regardless of the caller's working directory.
+case "$FIXTURES" in
+    /*) ;;
+    *) FIXTURES=$PWD/$FIXTURES ;;
+esac
+
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# A staged FIFO writer (read_fifo_with_writer) stays blocked in open() until
+# reaped; kill it on every exit path so a failing assertion cannot leak it.
+writer=
+cleanup() {
+    if [ -n "$writer" ]; then
+        kill "$writer" 2>/dev/null
+        wait "$writer" 2>/dev/null
+    fi
+    rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+# Used by the special-file cases to prove inspect never blocks opening a
+# FIFO. GNU coreutils and busybox both provide `timeout`; skip when absent.
+TIMEOUT=$(command -v timeout || true)
 
 NOTE='Note: this output displays certificate information only; reading the file successfully does not verify the signature or establish trust.'
 
@@ -286,16 +307,14 @@ expect_invalid() {
         fail "stderr should name the input path '$file', got: $(cat "$TMP/stderr")"
 }
 
-# Run `trustpeek inspect $1` and require exit 1, empty stdout, and a stderr
-# diagnostic that reports a file READ failure (distinct from invalid
-# certificate content), names the path, and carries a real reason rather than
-# a stale errno ("Success" belongs to no failing operation).
-expect_read_failure() {
+# Asserts an already-finished run ($rc, $TMP/stdout, $TMP/stderr) is a file
+# READ failure: exit 1, empty stdout, a stderr diagnostic distinct from
+# invalid-certificate content that names the path and carries a real reason
+# rather than a stale errno ("Success" belongs to no failing operation).
+assert_read_failure_result() {
     file=$1
     detail_pattern=${2:-}
-    "$BIN" inspect "$file" >"$TMP/stdout" 2>"$TMP/stderr"
-    rc=$?
-    [ "$rc" -eq 1 ] || fail "expected exit 1, got $rc"
+    [ "$rc" -eq 1 ] || fail "expected exit 1, got $rc (stderr: $(cat "$TMP/stderr"))"
     [ -s "$TMP/stdout" ] && fail "stdout must be empty on read failure, got: $(cat "$TMP/stdout")"
     grep -q "failed to read file" "$TMP/stderr" ||
         fail "stderr should report a file read failure, got: $(cat "$TMP/stderr")"
@@ -311,6 +330,33 @@ expect_read_failure() {
         grep -q "$detail_pattern" "$TMP/stderr" ||
             fail "stderr should explain the cause ($detail_pattern), got: $(cat "$TMP/stderr")"
     fi
+}
+
+# Run `trustpeek inspect $1` and require exit 1, empty stdout, and a stderr
+# diagnostic that reports a file READ failure (distinct from invalid
+# certificate content), names the path, and carries a real reason.
+expect_read_failure() {
+    file=$1
+    detail_pattern=${2:-}
+    "$BIN" inspect "$file" >"$TMP/stdout" 2>"$TMP/stderr"
+    rc=$?
+    assert_read_failure_result "$file" "$detail_pattern"
+}
+
+# Same as expect_read_failure, but run under timeout so a path that wrongly
+# blocks on open (e.g. a FIFO without a writer) fails the case instead of
+# hanging the whole test suite.
+expect_read_failure_timed() {
+    file=$1
+    detail_pattern=${2:-}
+    if [ -z "$TIMEOUT" ]; then
+        echo "PASS: $CASE (skipped: timeout utility unavailable)"
+        exit 0
+    fi
+    $TIMEOUT 5 "$BIN" inspect "$file" >"$TMP/stdout" 2>"$TMP/stderr"
+    rc=$?
+    [ "$rc" -eq 124 ] && fail "inspect blocked on '$file' instead of rejecting its type"
+    assert_read_failure_result "$file" "$detail_pattern"
 }
 
 case "$CASE" in
@@ -607,6 +653,115 @@ case "$CASE" in
         # the read-failure diagnostic.
         mkdir -p "$TMP/dir with space/证书目录"
         expect_read_failure "$TMP/dir with space/证书目录" "[Dd]irectory"
+        ;;
+
+    read_fifo_no_writer)
+        # A FIFO with no writer must be rejected by file type without ever
+        # blocking in open(): the run is wrapped in timeout so the old
+        # open-first behavior fails here instead of hanging the suite.
+        mkfifo "$TMP/pipe.pem"
+        expect_read_failure_timed "$TMP/pipe.pem" "[Pp]ipe"
+        ;;
+
+    read_fifo_with_writer)
+        # Even with a writer already prepared to deliver a complete, valid
+        # PEM certificate, a FIFO is rejected by type and never read. A
+        # broken implementation would open the pipe, receive the valid PEM
+        # and print certificate info; the writer stays blocked in open()
+        # until the (correct) rejection. exec makes the background job the
+        # cat itself (so $! is the blocked writer the EXIT trap can reap),
+        # instead of a wrapper subshell that leaves an orphaned cat behind.
+        mkfifo "$TMP/pipe-ready.pem"
+        (exec cat "$FIXTURES/valid.pem" >"$TMP/pipe-ready.pem") &
+        writer=$!
+        sleep 1
+        expect_read_failure_timed "$TMP/pipe-ready.pem" "[Pp]ipe"
+        kill "$writer" 2>/dev/null
+        wait "$writer" 2>/dev/null
+        writer=
+        ;;
+
+    read_character_device)
+        # /dev/null is a character device whose reads return immediate EOF:
+        # it must be a read failure ("not a regular file"), never an empty
+        # certificate.
+        [ -e /dev/null ] || { echo "PASS: $CASE (skipped: /dev/null unavailable)"; exit 0; }
+        expect_read_failure /dev/null "[Cc]haracter device"
+        ;;
+
+    read_block_device)
+        # Block devices are rejected by type too. stat() needs no read
+        # permission, so the rejection happens even when open() would be
+        # denied; skip in environments that expose no block device nodes.
+        blkdev=$(find /dev -maxdepth 2 -type b 2>/dev/null | head -n 1)
+        [ -n "$blkdev" ] || { echo "PASS: $CASE (skipped: no block device under /dev)"; exit 0; }
+        expect_read_failure_timed "$blkdev" "[Bb]lock device"
+        ;;
+
+    read_socket)
+        # A local (Unix-domain) socket node cannot be a certificate file and
+        # must be rejected without opening/connecting to it.
+        python3 - "$TMP/local.sock" <<'EOF'
+import socket
+import sys
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1])
+EOF
+        expect_read_failure_timed "$TMP/local.sock" "[Ss]ocket"
+        ;;
+
+    symlink_to_regular)
+        # A symlink (even through a chain) to a readable regular file works
+        # exactly like inspecting the target file directly.
+        ln -s "$FIXTURES/valid.pem" "$TMP/target-link.pem"
+        ln -s "$TMP/target-link.pem" "$TMP/chain-link.pem"
+        write_expected_valid PEM "$TMP/expected"
+        expect_success "$TMP/chain-link.pem" "$TMP/expected"
+        ;;
+
+    symlink_to_directory)
+        # A link to a directory is rejected according to the target type;
+        # the diagnostic keeps the link path the user actually passed.
+        mkdir -p "$TMP/real-dir"
+        ln -s "$TMP/real-dir" "$TMP/dir-link"
+        expect_read_failure "$TMP/dir-link" "[Dd]irectory"
+        ;;
+
+    symlink_to_fifo)
+        # A link to a writer-less FIFO follows to the FIFO, is rejected by
+        # type, and must not block.
+        mkfifo "$TMP/real-fifo"
+        ln -s "$TMP/real-fifo" "$TMP/fifo-link"
+        expect_read_failure_timed "$TMP/fifo-link" "[Pp]ipe"
+        ;;
+
+    symlink_to_character_device)
+        # A link to /dev/null is rejected as a character device (never as an
+        # empty certificate), with the link path in the diagnostic.
+        [ -e /dev/null ] || { echo "PASS: $CASE (skipped: /dev/null unavailable)"; exit 0; }
+        ln -s /dev/null "$TMP/null-link"
+        expect_read_failure "$TMP/null-link" "[Cc]haracter device"
+        ;;
+
+    symlink_dangling)
+        # A link whose target does not exist is a read failure naming the
+        # link path and explaining the missing target.
+        ln -s "$TMP/missing-target.pem" "$TMP/dangling-link"
+        expect_read_failure "$TMP/dangling-link" "[Nn]o such"
+        ;;
+
+    symlink_to_unreadable)
+        # A link to an existing regular file without read permission is a
+        # read failure (permission reason), still naming the link path; root
+        # bypasses permission checks, so skip when running as root.
+        if [ "$(id -u)" -eq 0 ]; then
+            echo "PASS: $CASE (skipped for root)"
+            exit 0
+        fi
+        cp "$FIXTURES/valid.pem" "$TMP/locked-target.pem"
+        chmod 000 "$TMP/locked-target.pem"
+        ln -s "$TMP/locked-target.pem" "$TMP/locked-link"
+        expect_read_failure "$TMP/locked-link" "[Pp]ermission"
         ;;
 
     *)

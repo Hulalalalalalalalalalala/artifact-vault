@@ -46,6 +46,17 @@ if(BUILD_TESTING)
         read_nonexistent
         read_permission_denied
         read_directory_path_with_space
+        read_fifo_no_writer
+        read_fifo_with_writer
+        read_character_device
+        read_block_device
+        read_socket
+        symlink_to_regular
+        symlink_to_directory
+        symlink_to_fifo
+        symlink_to_character_device
+        symlink_dangling
+        symlink_to_unreadable
     )
     foreach(case IN LISTS TRUSTPEEK_CASES)
         add_test(

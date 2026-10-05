@@ -302,36 +302,91 @@ std::string format_fingerprint(const unsigned char* digest, size_t length) {
     return out;
 }
 
+// Describes why a non-regular file type cannot serve as certificate input.
+// Every message states that the target is not a regular file so the reader
+// can tell "pick another path" apart from "the certificate content is bad".
+const char* non_regular_file_reason(mode_t mode) {
+    if (S_ISDIR(mode)) {
+        return "is a directory, not a regular file";
+    }
+    if (S_ISCHR(mode)) {
+        return "is a character device, not a regular file";
+    }
+    if (S_ISBLK(mode)) {
+        return "is a block device, not a regular file";
+    }
+    if (S_ISFIFO(mode)) {
+        return "is a named pipe (FIFO), not a regular file";
+    }
+    if (S_ISSOCK(mode)) {
+        return "is a socket, not a regular file";
+    }
+    return "is not a regular file";
+}
+
 // Reads the whole regular file into contents. Only a complete read that
-// reaches end of file is a success: a directory, a non-regular file type, a
-// partial read followed by an error, or any open/stat failure all return a
-// read error message. errno is captured immediately after the failing call so
-// the reason always belongs to this operation (never a stale "Success").
+// reaches end of file is a success: a non-regular file type (directory,
+// named pipe, character/block device or socket), a partial read followed by
+// an error, or any stat/open failure all return a read error message.
+//
+// The type check happens via stat() BEFORE open(): opening a FIFO blocks
+// until another process opens it for writing (the rejection must not depend
+// on any writer existing), and a device such as /dev/null returns immediate
+// EOF that would otherwise be misread as an empty certificate. stat()
+// follows symlinks, so a link is accepted or rejected based on its final
+// target while the diagnostic still names the link path the user passed.
+// errno is captured immediately after the failing call so the reason always
+// belongs to this operation (never a stale "Success").
 bool read_file_contents(const std::string& path, std::string& contents,
                         std::string& error) {
-    int fd = open(path.c_str(), O_RDONLY);
+    struct stat status {};
+    if (stat(path.c_str(), &status) != 0) {
+        // Covers a missing path, a dangling symlink target, and denied
+        // search permission on a path component.
+        int saved_errno = errno;
+        error = std::strerror(saved_errno);
+        return false;
+    }
+    if (!S_ISREG(status.st_mode)) {
+        // Reject without ever opening the path: no blocking on a FIFO, no
+        // reading from a device or socket.
+        error = std::string(non_regular_file_reason(status.st_mode)) +
+                "; inspect only accepts a regular file as a certificate "
+                "file";
+        return false;
+    }
+
+    // O_NONBLOCK makes open() return immediately even if the path was
+    // swapped for a FIFO between the stat() above and this open(); on
+    // regular files the flag has no effect on Linux, so the read loop below
+    // behaves exactly as before.
+    int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         int saved_errno = errno;
         error = std::strerror(saved_errno);
         return false;
     }
 
-    struct stat status {};
-    if (fstat(fd, &status) != 0) {
+    struct stat fd_status {};
+    if (fstat(fd, &fd_status) != 0) {
         int saved_errno = errno;
         close(fd);
         error = std::strerror(saved_errno);
         return false;
     }
-    if (S_ISDIR(status.st_mode)) {
+    // The path could have been swapped between stat() and open(); the opened
+    // descriptor is what gets read, so its type must win.
+    if (!S_ISREG(fd_status.st_mode)) {
         close(fd);
-        error = "is a directory; a certificate file cannot be a directory";
+        error = std::string(non_regular_file_reason(fd_status.st_mode)) +
+                "; inspect only accepts a regular file as a certificate "
+                "file";
         return false;
     }
 
     contents.clear();
-    if (status.st_size > 0) {
-        contents.reserve(static_cast<size_t>(status.st_size));
+    if (fd_status.st_size > 0) {
+        contents.reserve(static_cast<size_t>(fd_status.st_size));
     }
     char buffer[65536];
     while (true) {
