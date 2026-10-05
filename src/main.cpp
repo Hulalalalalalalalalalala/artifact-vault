@@ -227,14 +227,21 @@ bool format_name(X509_NAME* name, std::string& out) {
         if (object == nullptr || asn1_value == nullptr) return false;
 
         const char* short_name = nullptr;
-        char oid_buffer[80];
+        std::string dotted_oid;
         int nid = OBJ_obj2nid(object);
         if (nid != NID_undef) short_name = OBJ_nid2sn(nid);
         if (short_name == nullptr) {
-            if (OBJ_obj2txt(oid_buffer, sizeof(oid_buffer), object, 1) <= 0) {
-                return false;
-            }
-            short_name = oid_buffer;
+            // Size the buffer from the dotted form itself: an unknown OID's
+            // decimal text can be arbitrarily long, so a fixed buffer would
+            // silently clip its tail and make distinct OIDs look identical.
+            int oid_length = OBJ_obj2txt(nullptr, 0, object, 1);
+            if (oid_length <= 0) return false;
+            dotted_oid.resize(static_cast<size_t>(oid_length));
+            int written = OBJ_obj2txt(dotted_oid.data(),
+                                      static_cast<int>(dotted_oid.size()) + 1,
+                                      object, 1);
+            if (written != oid_length) return false;
+            short_name = dotted_oid.c_str();
         }
 
         unsigned char* utf8_raw = nullptr;
