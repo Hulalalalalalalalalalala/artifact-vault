@@ -75,7 +75,7 @@ Note: this output displays certificate information only; reading the file succes
   - 只包含公钥、私钥或其他非证书内容；
   - PEM 中出现第二个证书块或其他非空白内容；
   - DER 证书之后存在多余字节。
-- 文件不存在、不可读（如权限不足）时报告读取失败。
+- 文件不存在、不可读（如权限不足），或把目录当成证书文件传入、读取内容时发生系统错误时，一律报告读取失败（`failed to read file`），与证书格式错误区分开；只有完整读到文件末尾后才判断内容是否为证书。
 
 ## 查看信息不等于信任判断
 

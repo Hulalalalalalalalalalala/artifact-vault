@@ -178,6 +178,33 @@ expect_invalid() {
         fail "stderr should name the input path '$file', got: $(cat "$TMP/stderr")"
 }
 
+# Run `trustpeek inspect $1` and require exit 1, empty stdout, and a stderr
+# diagnostic that reports a file READ failure (distinct from invalid
+# certificate content), names the path, and carries a real reason rather than
+# a stale errno ("Success" belongs to no failing operation).
+expect_read_failure() {
+    file=$1
+    detail_pattern=${2:-}
+    "$BIN" inspect "$file" >"$TMP/stdout" 2>"$TMP/stderr"
+    rc=$?
+    [ "$rc" -eq 1 ] || fail "expected exit 1, got $rc"
+    [ -s "$TMP/stdout" ] && fail "stdout must be empty on read failure, got: $(cat "$TMP/stdout")"
+    grep -q "failed to read file" "$TMP/stderr" ||
+        fail "stderr should report a file read failure, got: $(cat "$TMP/stderr")"
+    grep -qF "$file" "$TMP/stderr" ||
+        fail "stderr should name the input path '$file', got: $(cat "$TMP/stderr")"
+    if grep -q "invalid certificate" "$TMP/stderr"; then
+        fail "read failure must not be classified as invalid certificate content: $(cat "$TMP/stderr")"
+    fi
+    if grep -qF ": Success" "$TMP/stderr"; then
+        fail "read failure must explain the real reason, not 'Success': $(cat "$TMP/stderr")"
+    fi
+    if [ -n "$detail_pattern" ]; then
+        grep -q "$detail_pattern" "$TMP/stderr" ||
+            fail "stderr should explain the cause ($detail_pattern), got: $(cat "$TMP/stderr")"
+    fi
+}
+
 case "$CASE" in
     pem_basic)
         write_expected_valid PEM "$TMP/expected"
@@ -398,6 +425,37 @@ case "$CASE" in
 
     private_key_only)
         expect_invalid "$FIXTURES/private_key.pem"
+        ;;
+
+    read_directory)
+        # A directory opens successfully on POSIX but cannot be read as a
+        # certificate file: it must be diagnosed as a read failure with the
+        # directory reason, never as an empty/malformed certificate.
+        mkdir -p "$TMP/certs"
+        expect_read_failure "$TMP/certs" "[Dd]irectory"
+        ;;
+
+    read_nonexistent)
+        expect_read_failure "$TMP/does-not-exist.pem" "[Nn]o such"
+        ;;
+
+    read_permission_denied)
+        # Mode 000 denies read; root bypasses permission checks, so the case
+        # is only meaningful for an unprivileged runner.
+        if [ "$(id -u)" -eq 0 ]; then
+            echo "PASS: $CASE (skipped for root)"
+            exit 0
+        fi
+        cp "$FIXTURES/valid.pem" "$TMP/locked.pem"
+        chmod 000 "$TMP/locked.pem"
+        expect_read_failure "$TMP/locked.pem" "[Pp]ermission"
+        ;;
+
+    read_directory_path_with_space)
+        # Paths containing spaces and non-ASCII text must survive verbatim in
+        # the read-failure diagnostic.
+        mkdir -p "$TMP/dir with space/证书目录"
+        expect_read_failure "$TMP/dir with space/证书目录" "[Dd]irectory"
         ;;
 
     *)

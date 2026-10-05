@@ -39,6 +39,10 @@ if(BUILD_TESTING)
         der_trailing_bytes
         public_key_only
         private_key_only
+        read_directory
+        read_nonexistent
+        read_permission_denied
+        read_directory_path_with_space
     )
     foreach(case IN LISTS TRUSTPEEK_CASES)
         add_test(

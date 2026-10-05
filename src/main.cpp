@@ -2,11 +2,14 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -292,21 +295,70 @@ std::string format_fingerprint(const unsigned char* digest, size_t length) {
     return out;
 }
 
+// Reads the whole regular file into contents. Only a complete read that
+// reaches end of file is a success: a directory, a non-regular file type, a
+// partial read followed by an error, or any open/stat failure all return a
+// read error message. errno is captured immediately after the failing call so
+// the reason always belongs to this operation (never a stale "Success").
+bool read_file_contents(const std::string& path, std::string& contents,
+                        std::string& error) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        int saved_errno = errno;
+        error = std::strerror(saved_errno);
+        return false;
+    }
+
+    struct stat status {};
+    if (fstat(fd, &status) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        error = std::strerror(saved_errno);
+        return false;
+    }
+    if (S_ISDIR(status.st_mode)) {
+        close(fd);
+        error = "is a directory; a certificate file cannot be a directory";
+        return false;
+    }
+
+    contents.clear();
+    if (status.st_size > 0) {
+        contents.reserve(static_cast<size_t>(status.st_size));
+    }
+    char buffer[65536];
+    while (true) {
+        ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
+        if (bytes_read > 0) {
+            contents.append(buffer, static_cast<size_t>(bytes_read));
+        } else if (bytes_read == 0) {
+            break;  // end of file reached after a complete read
+        } else if (errno != EINTR) {
+            int saved_errno = errno;
+            close(fd);
+            contents.clear();
+            error = std::strerror(saved_errno);
+            return false;
+        }
+    }
+
+    if (close(fd) != 0) {
+        int saved_errno = errno;
+        contents.clear();
+        error = std::strerror(saved_errno);
+        return false;
+    }
+    return true;
+}
+
 int inspect_file(const std::string& path) {
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) {
+    std::string content;
+    std::string read_error;
+    if (!read_file_contents(path, content, read_error)) {
         std::cerr << "trustpeek: failed to read file '" << path
-                  << "': " << std::strerror(errno) << '\n';
+                  << "': " << read_error << '\n';
         return 1;
     }
-    std::ostringstream contents;
-    contents << stream.rdbuf();
-    if (stream.bad()) {
-        std::cerr << "trustpeek: failed to read file '" << path
-                  << "': " << std::strerror(errno) << '\n';
-        return 1;
-    }
-    std::string content = contents.str();
 
     if (content.empty()) {
         std::cerr << "trustpeek: invalid certificate in '" << path
