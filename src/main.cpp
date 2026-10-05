@@ -314,13 +314,30 @@ int inspect_file(const std::string& path) {
         return 1;
     }
 
-    const bool looks_like_pem =
-        content.find(kPemBegin) != std::string::npos;
-    const char* encoding_name = looks_like_pem ? "PEM" : "DER";
+    // The encoding is decided by what actually parses, never by the file
+    // extension and never by marker-like text inside the certificate itself
+    // (a subject name may legitimately contain "-----BEGIN CERTIFICATE-----").
+    //
+    // A DER certificate starts with a SEQUENCE tag (0x30), which no PEM file
+    // can start with, so the two formats cannot be confused: try DER first
+    // and require the certificate to occupy the entire file.
+    const auto* const der_begin =
+        reinterpret_cast<const unsigned char*>(content.data());
+    const auto* const der_end = der_begin + content.size();
+    const unsigned char* pointer = der_begin;
 
-    X509Ptr cert(nullptr, X509_free);
+    X509Ptr cert(d2i_X509(nullptr, &pointer,
+                          static_cast<long>(content.size())),
+                 X509_free);
+    bool is_pem = false;
 
-    if (looks_like_pem) {
+    if (cert) {
+        if (pointer != der_end) {
+            std::cerr << "trustpeek: invalid certificate in '" << path
+                      << "': trailing bytes after DER certificate\n";
+            return 1;
+        }
+    } else {
         BioPtr bio(BIO_new_mem_buf(content.data(),
                                   static_cast<int>(content.size())),
                    BIO_free_all);
@@ -331,26 +348,19 @@ int inspect_file(const std::string& path) {
         }
         cert.reset(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
         if (!cert) {
-            std::cerr << "trustpeek: invalid certificate in '" << path
-                      << "': PEM certificate block is malformed or truncated\n";
+            // The marker search below only picks the diagnostic wording;
+            // acceptance is always decided by the parse results above.
+            if (content.find(kPemBegin) != std::string::npos) {
+                std::cerr << "trustpeek: invalid certificate in '" << path
+                          << "': PEM certificate block is malformed or "
+                             "truncated\n";
+            } else {
+                std::cerr << "trustpeek: invalid certificate in '" << path
+                          << "': DER certificate is malformed or truncated\n";
+            }
             return 1;
         }
-    } else {
-        const auto* pointer =
-            reinterpret_cast<const unsigned char*>(content.data());
-        cert.reset(d2i_X509(nullptr, &pointer,
-                            static_cast<long>(content.size())));
-        if (!cert) {
-            std::cerr << "trustpeek: invalid certificate in '" << path
-                      << "': DER certificate is malformed or truncated\n";
-            return 1;
-        }
-        if (pointer != reinterpret_cast<const unsigned char*>(
-                            content.data() + content.size())) {
-            std::cerr << "trustpeek: invalid certificate in '" << path
-                      << "': trailing bytes after DER certificate\n";
-            return 1;
-        }
+        is_pem = true;
     }
 
     std::vector<unsigned char> der;
@@ -360,12 +370,14 @@ int inspect_file(const std::string& path) {
         return 1;
     }
 
-    if (looks_like_pem && !validate_single_pem(content, der)) {
+    if (is_pem && !validate_single_pem(content, der)) {
         std::cerr << "trustpeek: invalid certificate in '" << path
                   << "': expected exactly one PEM certificate block with no "
                      "other non-whitespace content\n";
         return 1;
     }
+
+    const char* encoding_name = is_pem ? "PEM" : "DER";
 
     std::string subject;
     std::string issuer;

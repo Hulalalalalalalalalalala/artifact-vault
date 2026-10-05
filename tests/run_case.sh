@@ -26,9 +26,11 @@ fingerprint_of() {
 }
 FINGERPRINT=$(fingerprint_of "$FIXTURES/valid.der")
 EXPIRED_FINGERPRINT=$(fingerprint_of "$FIXTURES/expired.der")
+MARKER_FINGERPRINT=$(fingerprint_of "$FIXTURES/marker.der")
 
 VALID_SUBJECT='C=CN, O=Trustpeek Test Org, OU=Engineering, CN=valid.example.test'
 EXPIRED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=expired.example.test'
+MARKER_SUBJECT='C=CN, O=Trustpeek Test Org, CN=marker -----BEGIN CERTIFICATE----- and -----END CERTIFICATE----- test'
 
 write_expected_valid() {  # $1 = encoding, $2 = output file
     {
@@ -38,6 +40,18 @@ write_expected_valid() {  # $1 = encoding, $2 = output file
         printf 'Not Before: 2020-01-01T00:00:00Z\n'
         printf 'Not After: 2040-01-01T00:00:00Z\n'
         printf 'SHA-256 Fingerprint: %s\n' "$FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+write_expected_marker() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$MARKER_SUBJECT"
+        printf 'Issuer: %s\n' "$MARKER_SUBJECT"
+        printf 'Not Before: 2021-01-01T00:00:00Z\n'
+        printf 'Not After: 2041-01-01T00:00:00Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$MARKER_FINGERPRINT"
         printf '%s\n' "$NOTE"
     } >"$2"
 }
@@ -152,6 +166,46 @@ case "$CASE" in
             fail "fixture should be self-signed (subject == issuer)"
         grep -qF "$NOTE" "$TMP/stdout" ||
             fail "output must keep the no-trust-verification Note"
+        ;;
+
+    der_marker_in_name)
+        # The subject name carries the PEM begin/end markers as ordinary
+        # attribute text. The file is still DER and must display normally.
+        write_expected_marker DER "$TMP/expected"
+        expect_success "$FIXTURES/marker.der" "$TMP/expected"
+        ;;
+
+    pem_marker_in_name)
+        # The same certificate saved as PEM: reported as PEM, and every
+        # field except the Encoding line matches the DER run.
+        write_expected_marker PEM "$TMP/expected"
+        expect_success "$FIXTURES/marker.pem" "$TMP/expected"
+        "$BIN" inspect "$FIXTURES/marker.der" >"$TMP/der.out" 2>/dev/null ||
+            fail "DER input failed"
+        tail -n +2 "$TMP/expected" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree on subject/issuer/validity/fingerprint"
+        ;;
+
+    der_marker_trailing_newline)
+        # A trailing newline still invalidates the DER file; the marker text
+        # inside the certificate must not turn it into acceptable "PEM".
+        { cat "$FIXTURES/marker.der"; printf '\n'; } >"$TMP/trailing.der"
+        expect_invalid "$TMP/trailing.der"
+        ;;
+
+    der_marker_trailing_pem_block)
+        # A DER certificate followed by a PEM block of the same certificate
+        # is neither a whole-file DER nor a single PEM block: reject.
+        cat "$FIXTURES/marker.der" "$FIXTURES/marker.pem" >"$TMP/mixed.bin"
+        expect_invalid "$TMP/mixed.bin"
+        ;;
+
+    pem_marker_second_block)
+        # The single-certificate limit still applies to the marker cert.
+        cat "$FIXTURES/marker.pem" "$FIXTURES/marker.pem" >"$TMP/two.pem"
+        expect_invalid "$TMP/two.pem"
         ;;
 
     empty_file)
