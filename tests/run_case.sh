@@ -26,9 +26,13 @@ fingerprint_of() {
 }
 FINGERPRINT=$(fingerprint_of "$FIXTURES/valid.der")
 EXPIRED_FINGERPRINT=$(fingerprint_of "$FIXTURES/expired.der")
+MARKER_FINGERPRINT=$(fingerprint_of "$FIXTURES/marker.der")
 
 VALID_SUBJECT='C=CN, O=Trustpeek Test Org, OU=Engineering, CN=valid.example.test'
 EXPIRED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=expired.example.test'
+# The marker text is ordinary attribute data inside the certificate, not
+# file structure; it must be displayed in full, never treated as a boundary.
+MARKER_SUBJECT='C=CN, O=Trustpeek Test Org, CN=-----BEGIN CERTIFICATE----- inside -----END CERTIFICATE-----'
 
 write_expected_valid() {  # $1 = encoding, $2 = output file
     {
@@ -127,6 +131,52 @@ case "$CASE" in
         expect_success "$TMP/whitespace.pem" "$TMP/expected"
         ;;
 
+    der_marker_in_subject)
+        # A DER certificate whose subject carries the PEM begin/end markers
+        # as plain text is still DER: the marker bytes are certificate data,
+        # not file structure.
+        {
+            printf 'Encoding: DER\n'
+            printf 'Subject: %s\n' "$MARKER_SUBJECT"
+            printf 'Issuer: %s\n' "$MARKER_SUBJECT"
+            printf 'Not Before: 2020-01-01T00:00:00Z\n'
+            printf 'Not After: 2040-01-01T00:00:00Z\n'
+            printf 'SHA-256 Fingerprint: %s\n' "$MARKER_FINGERPRINT"
+            printf '%s\n' "$NOTE"
+        } >"$TMP/expected"
+        expect_success "$FIXTURES/marker.der" "$TMP/expected"
+        ;;
+
+    pem_marker_in_subject)
+        {
+            printf 'Encoding: PEM\n'
+            printf 'Subject: %s\n' "$MARKER_SUBJECT"
+            printf 'Issuer: %s\n' "$MARKER_SUBJECT"
+            printf 'Not Before: 2020-01-01T00:00:00Z\n'
+            printf 'Not After: 2040-01-01T00:00:00Z\n'
+            printf 'SHA-256 Fingerprint: %s\n' "$MARKER_FINGERPRINT"
+            printf '%s\n' "$NOTE"
+        } >"$TMP/expected"
+        expect_success "$FIXTURES/marker.pem" "$TMP/expected"
+        ;;
+
+    marker_pem_der_same_fields)
+        # The marker certificate in both encodings: every field except the
+        # Encoding line must be identical.
+        "$BIN" inspect "$FIXTURES/marker.pem" >"$TMP/pem.out" 2>/dev/null ||
+            fail "PEM input failed"
+        "$BIN" inspect "$FIXTURES/marker.der" >"$TMP/der.out" 2>/dev/null ||
+            fail "DER input failed"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree on subject/issuer/validity/fingerprint"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        ;;
+
     expired_ok)
         # An expired but complete certificate still displays and exits 0.
         {
@@ -205,6 +255,14 @@ case "$CASE" in
     der_trailing_bytes)
         { cat "$FIXTURES/valid.der"; printf '\000\001\002'; } >"$TMP/trailing.der"
         expect_invalid "$TMP/trailing.der"
+        ;;
+
+    der_trailing_pem_block)
+        # A complete PEM block (markers included) appended after a DER
+        # certificate is still trailing junk: the markers in the extra data
+        # must not turn the file into an acceptable input.
+        cat "$FIXTURES/valid.der" "$FIXTURES/valid.pem" >"$TMP/trailing-pem.der"
+        expect_invalid "$TMP/trailing-pem.der"
         ;;
 
     public_key_only)

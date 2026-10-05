@@ -93,6 +93,34 @@ def main():
         expired.public_bytes(serialization.Encoding.DER)
     )
 
+    # A certificate whose subject carries the PEM begin/end markers as plain
+    # attribute text. The markers are data, not file structure: the DER file
+    # must still be reported as DER and the PEM twin as PEM.
+    marker_name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(
+                NameOID.ORGANIZATION_NAME, "Trustpeek Test Org"
+            ),
+            x509.NameAttribute(
+                NameOID.COMMON_NAME,
+                "-----BEGIN CERTIFICATE----- inside -----END CERTIFICATE-----",
+            ),
+        ]
+    )
+    _, marker = make_self_signed(
+        marker_name,
+        datetime.datetime(2020, 1, 1, tzinfo=utc),
+        datetime.datetime(2040, 1, 1, tzinfo=utc),
+        serial=0x1003,
+    )
+    (FIXTURES / "marker.pem").write_bytes(
+        marker.public_bytes(serialization.Encoding.PEM)
+    )
+    (FIXTURES / "marker.der").write_bytes(
+        marker.public_bytes(serialization.Encoding.DER)
+    )
+
 
 if __name__ == "__main__":
     main()

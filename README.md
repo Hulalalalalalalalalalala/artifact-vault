@@ -68,6 +68,7 @@ Note: this output displays certificate information only; reading the file succes
 
 - 一次只检查**一个完整的 X.509 证书**，接受 PEM 或 DER 编码。
 - 实际格式根据**文件内容**判断，与扩展名无关。例如把 PEM 文件改名为 `cert.der`，仍会报告 `Encoding: PEM`。
+- 判断依据是文件整体结构：PEM 要求整个文件恰好是一个证书块加周边空白，DER 要求整个文件恰好是一张证书。证书字段（如主体名称）里出现的 `-----BEGIN CERTIFICATE-----` 等标记文本只是普通数据，既不影响格式判断，也会作为属性值完整显示。
 - PEM 证书块前后允许空白（空格、制表符、空行、CRLF）。
 - 以下情况一律作为证书格式错误拒绝（退出码 1）：
   - 空文件或仅含空白；

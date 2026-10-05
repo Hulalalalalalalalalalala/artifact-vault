@@ -1,5 +1,4 @@
 #include <openssl/evp.h>
-#include <openssl/pem.h>
 #include <openssl/x509.h>
 
 #include <cctype>
@@ -17,7 +16,6 @@
 namespace {
 
 using X509Ptr = std::unique_ptr<X509, decltype(&X509_free)>;
-using BioPtr = std::unique_ptr<BIO, decltype(&BIO_free_all)>;
 
 struct OpenSSLFree {
     void operator()(unsigned char* pointer) const { OPENSSL_free(pointer); }
@@ -82,10 +80,12 @@ bool base64_decode(const std::string& input,
     return true;
 }
 
-// Verifies that the content is exactly one PEM certificate block surrounded
-// by nothing but whitespace, and that the base64 payload is the given DER.
-bool validate_single_pem(std::string_view content,
-                         const std::vector<unsigned char>& der) {
+// If the content is exactly one PEM certificate block surrounded by nothing
+// but whitespace, decodes the base64 payload into `der` and returns true.
+// Anything else -- no block, several blocks, non-whitespace text around the
+// block, malformed base64 -- returns false and the content is not PEM.
+bool extract_single_pem_der(std::string_view content,
+                            std::vector<unsigned char>& der) {
     enum class State { BeforeMarker, InBody, AfterMarker };
     State state = State::BeforeMarker;
     std::string base64;
@@ -135,8 +135,7 @@ bool validate_single_pem(std::string_view content,
     }
     if (state != State::AfterMarker) return false;
 
-    std::vector<unsigned char> decoded;
-    return base64_decode(base64, decoded) && decoded == der;
+    return base64_decode(base64, der);
 }
 
 bool is_valid_utf8(const std::string& s) {
@@ -255,16 +254,6 @@ bool format_name(X509_NAME* name, std::string& out) {
     return true;
 }
 
-bool encode_to_der(X509* cert, std::vector<unsigned char>& der) {
-    int length = i2d_X509(cert, nullptr);
-    if (length <= 0) return false;
-    der.resize(static_cast<size_t>(length));
-    unsigned char* pointer = der.data();
-    int encoded = i2d_X509(cert, &pointer);
-    return encoded == length &&
-           pointer == der.data() + der.size();
-}
-
 bool format_time(const ASN1_TIME* time, std::string& out) {
     struct tm tm_value {};
     if (ASN1_TIME_to_tm(time, &tm_value) != 1) return false;
@@ -314,56 +303,25 @@ int inspect_file(const std::string& path) {
         return 1;
     }
 
-    const bool looks_like_pem =
-        content.find(kPemBegin) != std::string::npos;
-    const char* encoding_name = looks_like_pem ? "PEM" : "DER";
-
-    X509Ptr cert(nullptr, X509_free);
-
-    if (looks_like_pem) {
-        BioPtr bio(BIO_new_mem_buf(content.data(),
-                                  static_cast<int>(content.size())),
-                   BIO_free_all);
-        if (!bio) {
-            std::cerr << "trustpeek: internal error while reading '" << path
-                      << "'\n";
-            return 1;
-        }
-        cert.reset(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
-        if (!cert) {
-            std::cerr << "trustpeek: invalid certificate in '" << path
-                      << "': PEM certificate block is malformed or truncated\n";
-            return 1;
-        }
-    } else {
-        const auto* pointer =
-            reinterpret_cast<const unsigned char*>(content.data());
-        cert.reset(d2i_X509(nullptr, &pointer,
-                            static_cast<long>(content.size())));
-        if (!cert) {
-            std::cerr << "trustpeek: invalid certificate in '" << path
-                      << "': DER certificate is malformed or truncated\n";
-            return 1;
-        }
-        if (pointer != reinterpret_cast<const unsigned char*>(
-                            content.data() + content.size())) {
-            std::cerr << "trustpeek: invalid certificate in '" << path
-                      << "': trailing bytes after DER certificate\n";
-            return 1;
-        }
-    }
-
+    // The encoding is decided by the actual file structure, never by the
+    // file name or by marker-like text that may appear inside certificate
+    // fields: the content is PEM only when it is exactly one PEM certificate
+    // block plus surrounding whitespace; otherwise the whole file must be a
+    // single DER certificate with no trailing bytes.
     std::vector<unsigned char> der;
-    if (!encode_to_der(cert.get(), der)) {
-        std::cerr << "trustpeek: invalid certificate in '" << path
-                  << "': failed to re-encode certificate\n";
-        return 1;
+    const char* encoding_name = "DER";
+    if (extract_single_pem_der(content, der)) {
+        encoding_name = "PEM";
+    } else {
+        der.assign(content.begin(), content.end());
     }
 
-    if (looks_like_pem && !validate_single_pem(content, der)) {
+    const unsigned char* pointer = der.data();
+    X509Ptr cert(d2i_X509(nullptr, &pointer, static_cast<long>(der.size())),
+                 X509_free);
+    if (!cert || pointer != der.data() + der.size()) {
         std::cerr << "trustpeek: invalid certificate in '" << path
-                  << "': expected exactly one PEM certificate block with no "
-                     "other non-whitespace content\n";
+                  << "': not a single complete PEM or DER certificate\n";
         return 1;
     }
 

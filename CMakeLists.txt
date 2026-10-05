@@ -17,6 +17,9 @@ if(BUILD_TESTING)
         pem_wrong_extension
         der_wrong_extension
         pem_surrounding_whitespace
+        der_marker_in_subject
+        pem_marker_in_subject
+        marker_pem_der_same_fields
         expired_ok
         self_signed_ok
         empty_file
@@ -29,6 +32,7 @@ if(BUILD_TESTING)
         der_trailing_whitespace
         der_trailing_cert
         der_trailing_bytes
+        der_trailing_pem_block
         public_key_only
         private_key_only
     )
