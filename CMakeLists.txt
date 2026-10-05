@@ -21,6 +21,10 @@ if(BUILD_TESTING)
         self_signed_ok
         der_marker_in_name
         pem_marker_in_name
+        names_pem
+        names_der
+        names_pem_der_identical
+        names_subject_issuer_distinct
         der_marker_trailing_newline
         der_marker_trailing_pem_block
         pem_marker_second_block

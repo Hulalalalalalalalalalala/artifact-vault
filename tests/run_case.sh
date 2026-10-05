@@ -27,10 +27,19 @@ fingerprint_of() {
 FINGERPRINT=$(fingerprint_of "$FIXTURES/valid.der")
 EXPIRED_FINGERPRINT=$(fingerprint_of "$FIXTURES/expired.der")
 MARKER_FINGERPRINT=$(fingerprint_of "$FIXTURES/marker.der")
+NAMES_FINGERPRINT=$(fingerprint_of "$FIXTURES/names.der")
 
 VALID_SUBJECT='C=CN, O=Trustpeek Test Org, OU=Engineering, CN=valid.example.test'
 EXPIRED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=expired.example.test'
 MARKER_SUBJECT='C=CN, O=Trustpeek Test Org, CN=marker -----BEGIN CERTIFICATE----- and -----END CERTIFICATE----- test'
+# The names fixture has distinct subject and issuer names exercising the
+# full name-rendering surface: Chinese and other non-ASCII UTF-8 values, a
+# repeated attribute type (two OU entries), a multi-valued RDN joined with
+# '+' whose CN value itself contains an escaped plus, values with an
+# escaped comma and backslash, a value with escaped leading/trailing
+# spaces, and an attribute with no known short name shown as a dotted OID.
+NAMES_SUBJECT='C=CN, O=Comma\, Co., OU=dev+CN=plus\+inside, OU=back\\slash, CN=\ 边缘节点\ '
+NAMES_ISSUER='C=CN, O=示例科技有限公司, L=São Paulo, OU=研发部, OU=平台组, CN=根 CA 证书, 1.2.3.4.5=自定义属性'
 
 write_expected_valid() {  # $1 = encoding, $2 = output file
     {
@@ -52,6 +61,18 @@ write_expected_marker() {  # $1 = encoding, $2 = output file
         printf 'Not Before: 2021-01-01T00:00:00Z\n'
         printf 'Not After: 2041-01-01T00:00:00Z\n'
         printf 'SHA-256 Fingerprint: %s\n' "$MARKER_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+write_expected_names() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$NAMES_SUBJECT"
+        printf 'Issuer: %s\n' "$NAMES_ISSUER"
+        printf 'Not Before: 2022-01-01T00:00:00Z\n'
+        printf 'Not After: 2042-01-01T00:00:00Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$NAMES_FINGERPRINT"
         printf '%s\n' "$NOTE"
     } >"$2"
 }
@@ -186,6 +207,59 @@ case "$CASE" in
         tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
         cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
             fail "PEM and DER runs disagree on subject/issuer/validity/fingerprint"
+        ;;
+
+    names_pem)
+        # Complex names with distinct subject and issuer, saved as PEM:
+        # the full output must match byte for byte, including the escaped
+        # characters, the '+'-joined multi-valued RDN, the repeated OU
+        # attributes, the UTF-8 values and the dotted-OID attribute.
+        write_expected_names PEM "$TMP/expected"
+        expect_success "$FIXTURES/names.pem" "$TMP/expected"
+        ;;
+
+    names_der)
+        # The same certificate as DER: identical names and fields, only
+        # the Encoding line differs.
+        write_expected_names DER "$TMP/expected"
+        expect_success "$FIXTURES/names.der" "$TMP/expected"
+        ;;
+
+    names_pem_der_identical)
+        # Subject and Issuer of the same certificate must be byte-identical
+        # between the PEM and DER runs, with each encoding line reporting
+        # the actual format. Both runs exit 0 with empty stderr.
+        "$BIN" inspect "$FIXTURES/names.pem" >"$TMP/pem.out" 2>"$TMP/pem.err" ||
+            fail "PEM input failed"
+        [ -s "$TMP/pem.err" ] && fail "PEM run wrote to stderr: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/names.der" >"$TMP/der.out" 2>"$TMP/der.err" ||
+            fail "DER input failed"
+        [ -s "$TMP/der.err" ] && fail "DER run wrote to stderr: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree on subject/issuer/validity/fingerprint"
+        ;;
+
+    names_subject_issuer_distinct)
+        # The two name lines must not be collapsed into one another: the
+        # subject line carries exactly the subject attributes and the
+        # issuer line exactly the issuer attributes, in certificate order.
+        "$BIN" inspect "$FIXTURES/names.pem" >"$TMP/stdout" 2>"$TMP/stderr" ||
+            fail "inspect failed"
+        [ -s "$TMP/stderr" ] && fail "expected empty stderr, got: $(cat "$TMP/stderr")"
+        subject=$(sed -n 's/^Subject: //p' "$TMP/stdout")
+        issuer=$(sed -n 's/^Issuer: //p' "$TMP/stdout")
+        [ "$subject" = "$NAMES_SUBJECT" ] ||
+            fail "subject line mismatch: '$subject'"
+        [ "$issuer" = "$NAMES_ISSUER" ] ||
+            fail "issuer line mismatch: '$issuer'"
+        [ "$subject" != "$issuer" ] ||
+            fail "subject and issuer must keep their distinct names"
         ;;
 
     der_marker_trailing_newline)

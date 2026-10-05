@@ -120,6 +120,70 @@ def main():
         marker.public_bytes(serialization.Encoding.PEM)
     )
 
+    # A certificate whose subject and issuer differ and both carry complex
+    # names: Chinese and other non-ASCII values, a repeated attribute type
+    # (two OU entries that must not be merged), a multi-valued RDN whose
+    # member value itself contains a plus sign, values containing a comma,
+    # a backslash and leading/trailing spaces, and an attribute with no
+    # known short name (displayed as a dotted OID).
+    issuer_name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "示例科技有限公司"),
+            x509.NameAttribute(NameOID.LOCALITY_NAME, "São Paulo"),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "研发部"),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "平台组"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "根 CA 证书"),
+            x509.NameAttribute(x509.ObjectIdentifier("1.2.3.4.5"), "自定义属性"),
+        ]
+    )
+    subject_name = x509.Name(
+        [
+            x509.RelativeDistinguishedName(
+                [x509.NameAttribute(NameOID.COUNTRY_NAME, "CN")]
+            ),
+            x509.RelativeDistinguishedName(
+                [x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Comma, Co.")]
+            ),
+            x509.RelativeDistinguishedName(
+                [
+                    x509.NameAttribute(NameOID.COMMON_NAME, "plus+inside"),
+                    x509.NameAttribute(
+                        NameOID.ORGANIZATIONAL_UNIT_NAME, "dev"
+                    ),
+                ]
+            ),
+            x509.RelativeDistinguishedName(
+                [
+                    x509.NameAttribute(
+                        NameOID.ORGANIZATIONAL_UNIT_NAME, "back\\slash"
+                    )
+                ]
+            ),
+            x509.RelativeDistinguishedName(
+                [x509.NameAttribute(NameOID.COMMON_NAME, " 边缘节点 ")]
+            ),
+        ]
+    )
+    issuer_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    names = (
+        x509.CertificateBuilder()
+        .subject_name(subject_name)
+        .issuer_name(issuer_name)
+        .public_key(subject_key.public_key())
+        .serial_number(0x1004)
+        .not_valid_before(datetime.datetime(2022, 1, 1, tzinfo=utc))
+        .not_valid_after(datetime.datetime(2042, 1, 1, tzinfo=utc))
+        .sign(issuer_key, hashes.SHA256())
+    )
+    (FIXTURES / "names.der").write_bytes(
+        names.public_bytes(serialization.Encoding.DER)
+    )
+    (FIXTURES / "names.pem").write_bytes(
+        names.public_bytes(serialization.Encoding.PEM)
+    )
+
 
 if __name__ == "__main__":
     main()
