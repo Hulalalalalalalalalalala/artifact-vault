@@ -302,13 +302,48 @@ std::string format_fingerprint(const unsigned char* digest, size_t length) {
     return out;
 }
 
+// Explains why a non-regular path cannot be read as a certificate. Every
+// wording names the actual file type and states that a regular file is
+// required.
+const char* non_regular_file_reason(mode_t mode) {
+    if (S_ISDIR(mode)) return "is a directory, not a regular file";
+    if (S_ISFIFO(mode))
+        return "is a named pipe (FIFO), not a regular file";
+    if (S_ISCHR(mode))
+        return "is a character device, not a regular file";
+    if (S_ISBLK(mode))
+        return "is a block device, not a regular file";
+    if (S_ISSOCK(mode))
+        return "is a local socket, not a regular file";
+    return "is not a regular file";
+}
+
 // Reads the whole regular file into contents. Only a complete read that
-// reaches end of file is a success: a directory, a non-regular file type, a
-// partial read followed by an error, or any open/stat failure all return a
-// read error message. errno is captured immediately after the failing call so
-// the reason always belongs to this operation (never a stale "Success").
+// reaches end of file is a success: a directory, a named pipe, a device, a
+// socket, a partial read followed by an error, or any open/stat failure all
+// return a read error message. errno is captured immediately after the
+// failing call so the reason always belongs to this operation (never a stale
+// "Success").
+//
+// The type is checked with stat() BEFORE open(): a plain open(O_RDONLY) of a
+// FIFO blocks until another process opens it for writing, so a pipe must be
+// rejected by its type alone, regardless of writers or the data they could
+// send. stat() follows symbolic links, hence a link is accepted or rejected
+// according to its final target (a dangling link fails with the stat errno),
+// while the diagnostic later reports the path exactly as the user passed it.
 bool read_file_contents(const std::string& path, std::string& contents,
                         std::string& error) {
+    struct stat status {};
+    if (stat(path.c_str(), &status) != 0) {
+        int saved_errno = errno;
+        error = std::strerror(saved_errno);
+        return false;
+    }
+    if (!S_ISREG(status.st_mode)) {
+        error = non_regular_file_reason(status.st_mode);
+        return false;
+    }
+
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         int saved_errno = errno;
@@ -316,16 +351,20 @@ bool read_file_contents(const std::string& path, std::string& contents,
         return false;
     }
 
-    struct stat status {};
-    if (fstat(fd, &status) != 0) {
+    // Re-check the type on the opened descriptor: the path could have been
+    // replaced between stat() and open(). Reject before reading so a device
+    // that yields EOF immediately is still a read failure, never an empty
+    // certificate.
+    struct stat opened_status {};
+    if (fstat(fd, &opened_status) != 0) {
         int saved_errno = errno;
         close(fd);
         error = std::strerror(saved_errno);
         return false;
     }
-    if (S_ISDIR(status.st_mode)) {
+    if (!S_ISREG(opened_status.st_mode)) {
         close(fd);
-        error = "is a directory; a certificate file cannot be a directory";
+        error = non_regular_file_reason(opened_status.st_mode);
         return false;
     }
 

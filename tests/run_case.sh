@@ -313,6 +313,33 @@ expect_read_failure() {
     fi
 }
 
+# Like expect_read_failure, but the inspection is run under `timeout` so a
+# regression that blocks on a FIFO (waiting for a writer) fails the case
+# loudly instead of hanging the whole test run.
+expect_read_failure_bounded() {
+    file=$1
+    detail_pattern=${2:-}
+    timeout 5 "$BIN" inspect "$file" >"$TMP/stdout" 2>"$TMP/stderr"
+    rc=$?
+    [ "$rc" -eq 124 ] && fail "inspect blocked (timed out) on '$file'; special files must be rejected without waiting"
+    [ "$rc" -eq 1 ] || fail "expected exit 1, got $rc"
+    [ -s "$TMP/stdout" ] && fail "stdout must be empty on read failure, got: $(cat "$TMP/stdout")"
+    grep -q "failed to read file" "$TMP/stderr" ||
+        fail "stderr should report a file read failure, got: $(cat "$TMP/stderr")"
+    grep -qF "$file" "$TMP/stderr" ||
+        fail "stderr should name the input path '$file', got: $(cat "$TMP/stderr")"
+    if grep -q "invalid certificate" "$TMP/stderr"; then
+        fail "read failure must not be classified as invalid certificate content: $(cat "$TMP/stderr")"
+    fi
+    if grep -qF ": Success" "$TMP/stderr"; then
+        fail "read failure must explain the real reason, not 'Success': $(cat "$TMP/stderr")"
+    fi
+    if [ -n "$detail_pattern" ]; then
+        grep -q "$detail_pattern" "$TMP/stderr" ||
+            fail "stderr should explain the cause ($detail_pattern), got: $(cat "$TMP/stderr")"
+    fi
+}
+
 case "$CASE" in
     pem_basic)
         write_expected_valid PEM "$TMP/expected"
@@ -607,6 +634,134 @@ case "$CASE" in
         # the read-failure diagnostic.
         mkdir -p "$TMP/dir with space/证书目录"
         expect_read_failure "$TMP/dir with space/证书目录" "[Dd]irectory"
+        ;;
+
+    read_fifo_no_writer)
+        # A FIFO with nobody writing must be rejected by file type without
+        # blocking: stat() precedes open(), so inspect never waits for a
+        # writer. Bounded by timeout in the bounded helper.
+        mkfifo "$TMP/pipe"
+        expect_read_failure_bounded "$TMP/pipe" "[Ff][Ii][Ff][Oo]"
+        ;;
+
+    read_fifo_with_pem_writer)
+        # Even with a writer streaming a complete valid PEM certificate, a
+        # FIFO is rejected purely by type — the data on offer is irrelevant.
+        # The writer holds the pipe open (so a writer is connected at inspect
+        # time) and a background reader drains it, keeping the writer from
+        # blocking on the small fixture and leaving no stray process behind.
+        mkfifo "$TMP/pipe"
+        # All three standard streams are redirected away from the test's
+        # ctest-connected stdout/stderr so these short-lived jobs can never
+        # hold the runner's pipe open even if they briefly outlive the case.
+        ( cat "$FIXTURES/valid.pem"; exec sleep 5 ) \
+            >"$TMP/pipe" </dev/null 2>/dev/null &
+        writer=$!
+        ( cat "$TMP/pipe" >/dev/null ) </dev/null >/dev/null 2>/dev/null &
+        reader=$!
+        # Wait until both ends are connected before inspecting.
+        sleep 0.2
+        expect_read_failure_bounded "$TMP/pipe" "[Ff][Ii][Ff][Oo]"
+        kill "$writer" "$reader" 2>/dev/null
+        wait 2>/dev/null
+        ;;
+
+    read_character_device)
+        # /dev/null is a char device that returns EOF immediately; that must
+        # stay a read failure and never be reported as an empty certificate.
+        expect_read_failure_bounded "/dev/null" "[Cc]haracter device"
+        ;;
+
+    read_block_device)
+        # Pick any available block device; the type check rejects it before
+        # reading. /dev usually exposes a loop device in CI containers.
+        blk=""
+        for cand in /dev/loop0 /dev/loop1 /dev/sda /dev/vda /dev/xvda; do
+            if [ -b "$cand" ]; then blk=$cand; break; fi
+        done
+        if [ -z "$blk" ]; then
+            # Last resort: synthesize a block node (needs CAP_MKNOD).
+            if mknod "$TMP/blk" b 7 0 2>/dev/null && [ -b "$TMP/blk" ]; then
+                blk="$TMP/blk"
+            fi
+        fi
+        if [ -z "$blk" ]; then
+            echo "PASS: $CASE (no block device available; S_ISBLK branch covered manually)"
+            exit 0
+        fi
+        expect_read_failure_bounded "$blk" "[Bb]lock device"
+        ;;
+
+    read_local_socket)
+        # A bound unix-domain socket leaves an S_IFSOCK pathname behind even
+        # after the listener exits (inspect only stats it, never connects), so
+        # no background process has to be kept alive.
+        python3 - "$TMP/sock" <<'PY'
+import os, socket, sys
+p = sys.argv[1]
+try:
+    os.unlink(p)
+except FileNotFoundError:
+    pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(p)
+s.listen(1)
+# Exit WITHOUT unlinking: the socket pathname stays on disk as S_IFSOCK.
+PY
+        [ -S "$TMP/sock" ] || fail "test setup: unix socket was not created"
+        expect_read_failure_bounded "$TMP/sock" "[Ll]ocal socket"
+        ;;
+
+    read_symlink_to_regular_ok)
+        # A symlink to a readable regular file behaves exactly like passing
+        # the target directly. Stage the target in the absolute $TMP so the
+        # case is robust even if $FIXTURES is a relative path.
+        cp "$FIXTURES/valid.pem" "$TMP/target.pem"
+        ln -s "$TMP/target.pem" "$TMP/link.pem"
+        write_expected_valid PEM "$TMP/expected"
+        expect_success "$TMP/link.pem" "$TMP/expected"
+        ;;
+
+    read_symlink_to_directory)
+        # Link -> directory: failure reflects the TARGET type while the
+        # diagnostic keeps the link path the user typed.
+        mkdir -p "$TMP/adir"
+        ln -s "$TMP/adir" "$TMP/link_dir"
+        expect_read_failure "$TMP/link_dir" "[Dd]irectory"
+        ;;
+
+    read_symlink_to_fifo)
+        # Link -> FIFO: rejected by the target's type, no blocking, and the
+        # link path is what the diagnostic reports.
+        mkfifo "$TMP/target_fifo"
+        ln -s "$TMP/target_fifo" "$TMP/link_fifo"
+        expect_read_failure_bounded "$TMP/link_fifo" "[Ff][Ii][Ff][Oo]"
+        ;;
+
+    read_symlink_to_device)
+        # Link -> char device: rejected like the device itself, link path kept.
+        ln -s /dev/null "$TMP/link_null"
+        expect_read_failure_bounded "$TMP/link_null" "[Cc]haracter device"
+        ;;
+
+    read_symlink_dangling)
+        # Link whose target does not exist: a read failure carrying the real
+        # cause, not an invalid-certificate error.
+        ln -s "$TMP/missing-target" "$TMP/link_missing"
+        expect_read_failure "$TMP/link_missing" "[Nn]o such"
+        ;;
+
+    read_symlink_permission_denied)
+        # Link -> mode-000 regular file: permission failure (real cause) with
+        # the link path preserved; root bypasses perms like the existing case.
+        if [ "$(id -u)" -eq 0 ]; then
+            echo "PASS: $CASE (skipped for root)"
+            exit 0
+        fi
+        cp "$FIXTURES/valid.pem" "$TMP/locked.pem"
+        chmod 000 "$TMP/locked.pem"
+        ln -s "$TMP/locked.pem" "$TMP/link_locked"
+        expect_read_failure "$TMP/link_locked" "[Pp]ermission"
         ;;
 
     *)
