@@ -50,6 +50,7 @@ EXPIRED_FINGERPRINT=$(fingerprint_of "$FIXTURES/expired.der")
 MARKER_FINGERPRINT=$(fingerprint_of "$FIXTURES/marker.der")
 NAMES_FINGERPRINT=$(fingerprint_of "$FIXTURES/names.der")
 LONGOID_FINGERPRINT=$(fingerprint_of "$FIXTURES/longoid.der")
+CTRLCHARS_FINGERPRINT=$(fingerprint_of "$FIXTURES/ctrlchars.der")
 CENTURY_FINGERPRINT=$(fingerprint_of "$FIXTURES/century.der")
 MIXED_FINGERPRINT=$(fingerprint_of "$FIXTURES/mixedyears.der")
 GENERALIZED_FINGERPRINT=$(fingerprint_of "$FIXTURES/generalized.der")
@@ -86,6 +87,22 @@ OID_87="$OID_79"00000000
 # RDN group and the DN escaping all keep the same rules as the names fixture.
 LONGOID_SUBJECT='C=CN, OU=研发一部, OU=研发二部, OU=组内OU+CN=主体\\\+分组\\\,测试A, 1.2.3.4.5.6.7=短未知属性值, '"$OID_79"'=79位OID值甲, '"$OID_80"'=80位OID值乙, '"$OID_87"'=87位OID值丙, CN=\ 末端用户\ '
 LONGOID_ISSUER='C=CN, O=长OID测试根CA, L=北京+ST=北京\\\,市\+区\\\\根, '"$OID_79"'=颁发者79位值, '"$OID_80"'=颁发者80位值, '"$OID_87"'=颁发者87位值, 1.2.3.4.5.6.7=颁发者短未知值, CN=\ 颁发\,者\+根\\CA\ '
+
+# Subject and issuer of the control-character certificate
+# (tests/fixtures/ctrlchars.{pem,der}). Every byte below 0x20 in a name value
+# renders as "\" plus two uppercase hex digits, so a name can never grow
+# extra output lines; the byte-for-byte comparison pins:
+#   - LF/CR/TAB/NUL inside values as \0A, \0D, \09, \00;
+#   - the NUL in the middle of "中\00文" with both sides kept;
+#   - control characters at a value's start/end escaped, never trimmed;
+#   - the other sub-0x20 bytes (0x01, 0x07, 0x0B, 0x0C, 0x1F) escaped alike;
+#   - a real LF ("真实\0A换行") versus the literal characters backslash,
+#     "0", "A" ("字面\\0A文字": the backslash itself escapes) -- the two must
+#     never render identically;
+#   - repeated attributes, the "+"-joined RDN groups and the escaped ",+\"
+#     separators intact alongside the control bytes.
+CTRL_SUBJECT='C=CN, O=控制字符测试组织, OU=研发\09部\0A一组, OU=质量\0D组, L=\0A沪上+ST=北京\09, CN=中\00文, CN=真实\0A换行, CN=字面\\0A文字, OU=甲\01\07\0B\1F乙, CN=分\,隔\+符\\与\0B中文'
+CTRL_ISSUER='C=CN, O=颁发\09机构, OU=CA中心\0D, OU=\0A起始, L=北京+ST=\00起点, CN=根\\0D证书, CN=尾\00, title=换\0C页'
 
 # Subjects of the validity-time fixtures (all self-signed).
 CENTURY_SUBJECT='C=CN, O=Trustpeek Test Org, CN=century-pivot-1950.example.test'
@@ -137,6 +154,18 @@ write_expected_longoid() {  # $1 = encoding, $2 = output file
         printf 'Not Before: 2023-06-01T00:00:00Z\n'
         printf 'Not After: 2043-06-01T00:00:00Z\n'
         printf 'SHA-256 Fingerprint: %s\n' "$LONGOID_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+write_expected_ctrlchars() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$CTRL_SUBJECT"
+        printf 'Issuer: %s\n' "$CTRL_ISSUER"
+        printf 'Not Before: 2024-01-01T00:00:00Z\n'
+        printf 'Not After: 2044-01-01T00:00:00Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$CTRLCHARS_FINGERPRINT"
         printf '%s\n' "$NOTE"
     } >"$2"
 }
@@ -342,6 +371,122 @@ assert_names_structure() {
         *', CN=\ 终端用户证书\ ') ;;
         *) fail "leading/trailing spaces of final value must be preserved" ;;
     esac
+}
+
+# Structural guards for the control-character name output ($1 = captured
+# stdout file). The byte-for-byte expected comparison already pins
+# everything; these checks re-prove by name the properties the fixture
+# exists for, so a regression (a raw control byte breaking the line
+# structure, a trimmed value edge, a collapsed attribute) is explained
+# rather than shown as a raw diff.
+assert_ctrlchars_structure() {
+    out=$1
+    subject=$(sed -n 's/^Subject: //p' "$out")
+    issuer=$(sed -n 's/^Issuer: //p' "$out")
+
+    # Subject and issuer are different names, each on exactly one line: the
+    # control characters inside the values must not grow extra lines.
+    [ "$subject" != "$issuer" ] ||
+        fail "subject and issuer must render different names"
+    [ "$(grep -c '^Subject: ' "$out")" -eq 1 ] ||
+        fail "Subject must occupy exactly one line"
+    [ "$(grep -c '^Issuer: ' "$out")" -eq 1 ] ||
+        fail "Issuer must occupy exactly one line"
+    [ "$(wc -l <"$out")" -eq 7 ] ||
+        fail "output must have exactly 7 lines (no line split by a name)"
+    [ "$subject" = "$CTRL_SUBJECT" ] ||
+        fail "control-character subject rendered incompletely or reordered"
+    [ "$issuer" = "$CTRL_ISSUER" ] ||
+        fail "control-character issuer rendered incompletely or reordered"
+
+    # No raw control byte may leak into the output: the only bytes below
+    # 0x20 (plus DEL) in the whole stream are the 7 line-ending newlines.
+    ctrl_bytes=$(LC_ALL=C tr -cd '\000-\037\177' <"$out" | wc -c)
+    [ "$ctrl_bytes" -eq 7 ] ||
+        fail "output carries $ctrl_bytes raw control bytes, expected only the 7 newlines"
+
+    # Whole name, including the non-ASCII values, must remain valid UTF-8.
+    iconv -f UTF-8 -t UTF-8 "$out" >/dev/null ||
+        fail "output is not valid UTF-8"
+
+    # The visible escapes for LF, CR, TAB and NUL appear in both names.
+    for token in '\0A' '\0D' '\09' '\00'; do
+        case "$subject$issuer" in
+            *"$token"*) ;;
+            *) fail "missing visible escape: $token" ;;
+        esac
+    done
+
+    # A NUL in the middle of a value keeps the text on both sides.
+    case "$subject" in
+        *'CN=中\00文'*) ;;
+        *) fail "text around a mid-value NUL must survive" ;;
+    esac
+
+    # Control characters at a value's start/end are escaped, never trimmed
+    # away like surrounding whitespace.
+    for token in 'L=\0A沪上' 'ST=北京\09' 'OU=\0A起始' 'OU=CA中心\0D' \
+                  'ST=\00起点' 'CN=尾\00'; do
+        case "$subject $issuer" in
+            *"$token"*) ;;
+            *) fail "control character at value edge trimmed or altered: $token" ;;
+        esac
+    done
+
+    # A real newline renders as \0A while the literal three characters
+    # backslash, "0", "A" render as \\0A (the backslash itself escaped);
+    # the two must stay distinguishable.
+    case "$subject" in
+        *'CN=真实\0A换行'*) ;;
+        *) fail "real LF must render as \\0A" ;;
+    esac
+    case "$subject" in
+        *'CN=字面\\0A文字'*) ;;
+        *) fail "literal backslash-0-A must render as \\\\0A" ;;
+    esac
+    case "$issuer" in
+        *'CN=根\\0D证书'*) ;;
+        *) fail "literal backslash-0-D must render as \\\\0D" ;;
+    esac
+
+    # The remaining sub-0x20 bytes follow the same visible-escape rule.
+    case "$subject" in
+        *'OU=甲\01\07\0B\1F乙'*) ;;
+        *) fail "sub-0x20 bytes must each render as \\XX" ;;
+    esac
+    case "$issuer" in
+        *'title=换\0C页'*) ;;
+        *) fail "form feed must render as \\0C" ;;
+    esac
+
+    # Attribute structure survives the escaped bytes: repeated attributes
+    # stay repeated, the "+"-joined RDN groups keep their single bare "+",
+    # and the escaped ",+\" inside a value cannot become new attributes.
+    [ "$(printf '%s' "$subject" | grep -o 'OU=' | wc -l)" -eq 3 ] ||
+        fail "subject must keep all three OU attributes"
+    [ "$(printf '%s' "$subject" | grep -o 'CN=' | wc -l)" -eq 4 ] ||
+        fail "subject must keep all four CN attributes"
+    [ "$(printf '%s' "$issuer" | grep -o 'OU=' | wc -l)" -eq 2 ] ||
+        fail "issuer must keep both OU attributes"
+    case "$subject" in
+        *'L=\0A沪上+ST=北京\09'*) ;;
+        *) fail "subject multi-valued RDN grouping broken" ;;
+    esac
+    case "$issuer" in
+        *'L=北京+ST=\00起点'*) ;;
+        *) fail "issuer multi-valued RDN grouping broken" ;;
+    esac
+    [ "$(printf '%s' "$subject" | LC_ALL=C grep -oE '[^\\]\+' | wc -l)" -eq 1 ] ||
+        fail "subject must have exactly one unescaped group '+'"
+    [ "$(printf '%s' "$issuer" | LC_ALL=C grep -oE '[^\\]\+' | wc -l)" -eq 1 ] ||
+        fail "issuer must have exactly one unescaped group '+'"
+    case "$subject" in
+        *'CN=分\,隔\+符\\与\0B中文') ;;
+        *) fail "escaped separators in a value must not become attributes" ;;
+    esac
+
+    grep -qF "$NOTE" "$out" ||
+        fail "output must keep the no-trust-verification Note"
 }
 
 fail() {
@@ -642,6 +787,51 @@ case "$CASE" in
         pem_issuer=$(sed -n 's/^Issuer: //p' "$TMP/pem.out")
         [ "$pem_subject" != "$pem_issuer" ] ||
             fail "longoid fixture must have different subject and issuer"
+        ;;
+
+    der_control_chars)
+        # DER form of the certificate whose subject and issuer carry real
+        # control characters (LF/CR/TAB/NUL and other sub-0x20 bytes): each
+        # renders as "\" plus two uppercase hex digits, so both names stay
+        # on their own single lines; exit 0, empty stderr.
+        write_expected_ctrlchars DER "$TMP/expected"
+        expect_success "$FIXTURES/ctrlchars.der" "$TMP/expected"
+        assert_ctrlchars_structure "$TMP/expected"
+        ;;
+
+    pem_control_chars)
+        # The same certificate as PEM: reported as PEM while the Subject and
+        # Issuer lines stay byte-for-byte identical to the DER rendering.
+        write_expected_ctrlchars PEM "$TMP/expected"
+        expect_success "$FIXTURES/ctrlchars.pem" "$TMP/expected"
+        assert_ctrlchars_structure "$TMP/expected"
+        ;;
+
+    pem_der_control_chars_same)
+        # PEM vs DER of one certificate: Encoding reports the real format,
+        # everything else (both control-character names included) agrees.
+        "$BIN" inspect "$FIXTURES/ctrlchars.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/ctrlchars.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree on the control-character name fields"
+        assert_ctrlchars_structure "$TMP/der.out"
+        # Guard against weakening the fixture into another self-signed cert.
+        pem_subject=$(sed -n 's/^Subject: //p' "$TMP/pem.out")
+        pem_issuer=$(sed -n 's/^Issuer: //p' "$TMP/pem.out")
+        [ "$pem_subject" != "$pem_issuer" ] ||
+            fail "ctrlchars fixture must have different subject and issuer"
         ;;
 
     # --- Validity-time rendering -------------------------------------

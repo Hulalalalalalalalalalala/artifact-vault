@@ -27,6 +27,9 @@ if(BUILD_TESTING)
         der_long_oids
         pem_long_oids
         pem_der_long_oids_same
+        der_control_chars
+        pem_control_chars
+        pem_der_control_chars_same
         time_century_utc_der
         time_century_utc_pem
         time_pivot_49_and_50

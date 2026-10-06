@@ -153,6 +153,102 @@ def make_self_signed(name, not_before, not_after, serial):
     return key, cert
 
 
+def write_ctrlchars_fixtures():
+    """Write the ctrlchars.{der,pem} pair (also runnable on its own)."""
+    import datetime
+
+    utc = datetime.timezone.utc
+
+    # A certificate whose subject and issuer names carry real control
+    # characters (every byte below 0x20 renders as "\" + two uppercase hex
+    # digits, so a name can never grow extra output lines). Subject and
+    # issuer differ and each mixes the control characters with Chinese text,
+    # the ",+" separators and a literal backslash. The names exercise:
+    #   - LF, CR, TAB and NUL inside values -> \0A, \0D, \09, \00;
+    #   - a NUL in the MIDDLE of a value with text kept on both sides;
+    #   - control characters at the very start/end of a value (they must be
+    #     escaped, never trimmed like surrounding whitespace);
+    #   - the remaining sub-0x20 bytes (0x01, 0x07, 0x0B, 0x0C, 0x1F) under
+    #     the same visible-escape rule;
+    #   - a real LF ("\n" -> \0A) versus the three literal characters
+    #     backslash, "0", "A" (the backslash itself escapes -> \\0A), which
+    #     must not render identically;
+    #   - repeated attributes and a multi-valued RDN group whose "+" joining
+    #     and attribute order survive alongside the escaped bytes.
+    ctrl_subject = x509.Name(
+        [
+            rdn(NameOID.COUNTRY_NAME, "CN"),
+            rdn(NameOID.ORGANIZATION_NAME, "控制字符测试组织"),
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, "研发\t部\n一组"),
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, "质量\r组"),
+            x509.RelativeDistinguishedName(
+                [
+                    # Control character at the start of a value, inside a
+                    # "+"-joined RDN group.
+                    x509.NameAttribute(NameOID.LOCALITY_NAME, "\n沪上"),
+                    # Control character at the end of a value.
+                    x509.NameAttribute(
+                        NameOID.STATE_OR_PROVINCE_NAME, "北京\t"
+                    ),
+                ]
+            ),
+            # NUL in the middle: the text on both sides must survive.
+            rdn(NameOID.COMMON_NAME, "中\x00文"),
+            # A real newline ...
+            rdn(NameOID.COMMON_NAME, "真实\n换行"),
+            # ... versus the literal three characters "\0A": the backslash
+            # itself is escaped, so this renders as \\0A, never as \0A.
+            rdn(NameOID.COMMON_NAME, "字面\\0A文字"),
+            # The remaining sub-0x20 bytes follow the same escape rule.
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, "甲\x01\x07\x0b\x1f乙"),
+            # Separators and a control character inside one value: the
+            # escaped bytes must not turn into new attributes.
+            rdn(NameOID.COMMON_NAME, "分,隔+符\\与\x0b中文"),
+        ]
+    )
+    ctrl_issuer = x509.Name(
+        [
+            rdn(NameOID.COUNTRY_NAME, "CN"),
+            rdn(NameOID.ORGANIZATION_NAME, "颁发\t机构"),
+            # Control character at the end of a value.
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, "CA中心\r"),
+            # Control character at the start of a value.
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, "\n起始"),
+            x509.RelativeDistinguishedName(
+                [
+                    x509.NameAttribute(NameOID.LOCALITY_NAME, "北京"),
+                    # NUL at the very start of a value.
+                    x509.NameAttribute(
+                        NameOID.STATE_OR_PROVINCE_NAME, "\x00起点"
+                    ),
+                ]
+            ),
+            # Literal backslash + "0D" (not a real CR) -> \\0D.
+            rdn(NameOID.COMMON_NAME, "根\\0D证书"),
+            # NUL at the very end of a value.
+            rdn(NameOID.COMMON_NAME, "尾\x00"),
+            rdn(NameOID.TITLE, "换\x0c页"),
+        ]
+    )
+    ctrl_issuer_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    ctrl_subject_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    ctrl_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ctrl_subject)
+        .issuer_name(ctrl_issuer)
+        .public_key(ctrl_subject_key.public_key())
+        .serial_number(0x5001)
+        .not_valid_before(datetime.datetime(2024, 1, 1, tzinfo=utc))
+        .not_valid_after(datetime.datetime(2044, 1, 1, tzinfo=utc))
+        .sign(ctrl_issuer_key, hashes.SHA256())
+    )
+    write_cert_pair("ctrlchars", ctrl_cert.public_bytes(serialization.Encoding.DER))
+
+
 def main():
     import datetime
 
@@ -381,6 +477,8 @@ def main():
     (FIXTURES / "longoid.pem").write_bytes(
         long_oid_cert.public_bytes(serialization.Encoding.PEM)
     )
+
+    write_ctrlchars_fixtures()
 
     # --- Validity-time fixtures -----------------------------------------
     #
