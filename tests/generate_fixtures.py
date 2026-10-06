@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""Regenerate the committed test fixtures under tests/fixtures/.
+"""Optional maintenance script: regenerate the test samples under tests/fixtures/.
 
-The fixtures are checked into the repository so the regression tests never
-need network access, a system trust store, or even this script. Re-run only
-when a fixture must change; the certificates use fixed serial numbers and
-fixed validity windows so regeneration is deterministic except for the key
-material (new keys change the fingerprints, so update tests accordingly is
-NOT needed -- fingerprints are derived from the committed DER at test time).
+Only the PEM files are committed and act as the single source of truth. The
+regression suite needs no network access, no system trust store and not even
+this script: the matching DER byte streams are decoded from the committed PEM
+bodies at build time by tests/prepare_fixtures.sh (using the standard
+base64(1) utility), and expected fingerprints are hashed from those DERs at
+test time. Re-running this script is therefore optional and is only needed
+when a sample must change.
+
+As a byproduct this script also writes *.der next to the *.pem files (some
+samples are hand-rewritten at the DER level before being encoded); those DERs
+are ignored by git and are never read by the tests -- the build always
+re-derives DER data from the PEM files. The certificates use fixed serial
+numbers and fixed validity windows, so regeneration is deterministic except
+for the key material; new keys change the fingerprints, but no manual test
+update is needed because fingerprints are derived from the DER decoded out of
+the committed PEM at test time.
 """
 
 import base64

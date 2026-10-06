@@ -39,10 +39,28 @@ TIMEOUT=$(command -v timeout || true)
 
 NOTE='Note: this output displays certificate information only; reading the file successfully does not verify the signature or establish trust.'
 
-# The fingerprints are derived from the committed DER fixtures, so the
-# expected values stay in sync with the certificates on disk.
+# The fingerprints are derived from the DER samples in $FIXTURES, which are
+# decoded from the committed PEM samples at build time
+# (tests/prepare_fixtures.sh), so the expected values stay in sync with the
+# certificates shipped in the repository. A missing or empty DER must abort
+# the case with an explicit setup error instead of hashing nothing and
+# comparing against an empty fingerprint.
 fingerprint_of() {
-    sha256sum "$1" | cut -d' ' -f1 |
+    f=$1
+    [ -e "$f" ] || {
+        echo "FAIL: $CASE: test setup: missing DER sample $f (regression fixtures were not prepared; run the CMake build first)" >&2
+        exit 1
+    }
+    [ -s "$f" ] || {
+        echo "FAIL: $CASE: test setup: DER sample is empty: $f" >&2
+        exit 1
+    }
+    hash=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$hash" ] || {
+        echo "FAIL: $CASE: test setup: cannot compute fingerprint of $f" >&2
+        exit 1
+    }
+    printf '%s' "$hash" |
         tr 'a-f' 'A-F' | sed 's/\(..\)/\1:/g; s/:$//'
 }
 FINGERPRINT=$(fingerprint_of "$FIXTURES/valid.der")

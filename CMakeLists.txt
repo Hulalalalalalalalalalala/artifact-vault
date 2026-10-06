@@ -10,6 +10,39 @@ target_link_libraries(trustpeek PRIVATE OpenSSL::Crypto)
 
 include(CTest)
 if(BUILD_TESTING)
+    # The regression data are prepared offline from the committed PEM samples:
+    # the matching DER byte streams are decoded from the PEM bodies at build
+    # time into the build tree, so a clean source checkout needs no network,
+    # no Python cryptography package and no manually regenerated binaries.
+    find_program(BASE64_PROGRAM NAMES base64 REQUIRED)
+
+    set(TRUSTPEEK_FIXTURE_SCRIPTS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_fixtures.sh"
+    )
+    file(GLOB TRUSTPEEK_FIXTURE_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/*"
+    )
+    set(TRUSTPEEK_FIXTURES_DIR "${CMAKE_CURRENT_BINARY_DIR}/tests/fixtures")
+    set(TRUSTPEEK_FIXTURES_STAMP "${TRUSTPEEK_FIXTURES_DIR}.stamp")
+
+    add_custom_command(
+        OUTPUT "${TRUSTPEEK_FIXTURES_STAMP}"
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${TRUSTPEEK_FIXTURES_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${TRUSTPEEK_FIXTURES_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E env "BASE64=${BASE64_PROGRAM}"
+                "${TRUSTPEEK_FIXTURE_SCRIPTS}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+                "${TRUSTPEEK_FIXTURES_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E touch "${TRUSTPEEK_FIXTURES_STAMP}"
+        DEPENDS ${TRUSTPEEK_FIXTURE_SCRIPTS} ${TRUSTPEEK_FIXTURE_SOURCES}
+        COMMENT "Preparing regression certificate fixtures (DER decoded from committed PEM samples)"
+        VERBATIM
+    )
+    add_custom_target(trustpeek-fixtures ALL
+        DEPENDS "${TRUSTPEEK_FIXTURES_STAMP}"
+    )
+    add_dependencies(trustpeek trustpeek-fixtures)
+
     set(TRUSTPEEK_CASES
         pem_basic
         der_basic
@@ -85,7 +118,7 @@ if(BUILD_TESTING)
             NAME inspect_${case}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_case.sh
                     $<TARGET_FILE:trustpeek>
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures
+                    ${TRUSTPEEK_FIXTURES_DIR}
                     ${case}
         )
     endforeach()

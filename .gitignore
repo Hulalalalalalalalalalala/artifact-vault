@@ -1,1 +1,7 @@
 /build/
+
+# DER samples are not source data: they are decoded from the committed PEM
+# samples at build time (see tests/prepare_fixtures.sh). Running the optional
+# maintenance script tests/generate_fixtures.py leaves matching *.der files
+# here; keep them out of the PEM-only source tree.
+/tests/fixtures/*.der
