@@ -138,6 +138,34 @@ def write_cert_pair(stem, der):
     (FIXTURES / f"{stem}.pem").write_bytes(pem_from_der(der))
 
 
+def write_pem_body_trailing_fixtures(der):
+    """Single PEM blocks whose base64 body holds more than one certificate.
+
+    Both files look like an ordinary one-block PEM from the outside: one
+    BEGIN/END CERTIFICATE pair, no text outside the block, and base64 that
+    decodes completely. The decoded payload, however, is not exactly one
+    certificate:
+
+      * pem_body_trailing_nul.pem  -> the DER certificate plus one zero byte;
+      * pem_body_trailing_cert.pem -> the DER certificate followed by another
+        complete, byte-identical certificate.
+
+    A reader that accepts whatever certificate parses from the START of the
+    payload would wrongly report success; the trailing content is hidden
+    inside the base64 rather than visible as a second block or text outside
+    the markers. Both bodies have a base64 length that is a multiple of four
+    with padding only at the very end (the NUL case happens to need none), so
+    the whole body decodes cleanly and the rejection can only come from its
+    extra content, never from a truncated encoding.
+    """
+    (FIXTURES / "pem_body_trailing_nul.pem").write_bytes(
+        pem_from_der(der + b"\x00")
+    )
+    (FIXTURES / "pem_body_trailing_cert.pem").write_bytes(
+        pem_from_der(der + der)
+    )
+
+
 def make_self_signed(name, not_before, not_after, serial):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     cert = (
@@ -274,6 +302,9 @@ def main():
     (FIXTURES / "valid.pem").write_bytes(
         valid.public_bytes(serialization.Encoding.PEM)
     )
+    # Single-block PEM files whose base64 body is not exactly one certificate
+    # (one trailing zero byte, or a second complete identical certificate).
+    write_pem_body_trailing_fixtures(der)
     (FIXTURES / "private_key.pem").write_bytes(
         key.private_bytes(
             serialization.Encoding.PEM,

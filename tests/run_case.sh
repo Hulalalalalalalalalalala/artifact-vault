@@ -489,6 +489,36 @@ assert_ctrlchars_structure() {
         fail "output must keep the no-trust-verification Note"
 }
 
+# Decodes the base64 body of the single CERTIFICATE PEM block in $1 into $2,
+# asserting the PEM-integrity preconditions shared by the body-content cases:
+# exactly one begin/end marker pair, only whitespace outside the block, and a
+# body whose base64 decodes completely. When this passes, any rejection of the
+# file must come from excess content INSIDE the decoded payload -- not from
+# text outside the block, damaged markers or a truncated encoding.
+decode_single_pem_body() {
+    pem=$1
+    out=$2
+    # CRLF is accepted whitespace around and between PEM lines, so analyze a
+    # CR-stripped copy; the base64 alphabet contains no CR anyway.
+    tr -d '\r' <"$pem" >"$TMP/pem.normalized"
+    begin_count=$(grep -c '^-----BEGIN CERTIFICATE-----$' "$TMP/pem.normalized")
+    end_count=$(grep -c '^-----END CERTIFICATE-----$' "$TMP/pem.normalized")
+    [ "$begin_count" -eq 1 ] ||
+        fail "fixture must contain exactly one BEGIN CERTIFICATE marker, got $begin_count"
+    [ "$end_count" -eq 1 ] ||
+        fail "fixture must contain exactly one END CERTIFICATE marker, got $end_count"
+    outside=$(awk '
+        /^-----BEGIN CERTIFICATE-----$/ { in_block = 1; next }
+        /^-----END CERTIFICATE-----$/ { in_block = 0; next }
+        in_block { next }
+        { print }' "$TMP/pem.normalized" | tr -d '[:space:]')
+    [ -z "$outside" ] ||
+        fail "fixture must have no non-whitespace content outside the PEM block"
+    sed -n '/^-----BEGIN CERTIFICATE-----$/,/^-----END CERTIFICATE-----$/p' "$TMP/pem.normalized" |
+        sed '1d;$d' | tr -d '[:space:]' | base64 -d >"$out" ||
+        fail "PEM body base64 must decode completely (no truncated encoding)"
+}
+
 fail() {
     echo "FAIL: $CASE: $1" >&2
     exit 1
@@ -1057,6 +1087,86 @@ case "$CASE" in
     pem_text_after)
         { cat "$FIXTURES/valid.pem"; printf 'trailing comment\n'; } >"$TMP/text-after.pem"
         expect_invalid "$TMP/text-after.pem"
+        ;;
+
+    pem_body_trailing_nul)
+        # From the outside this is one ordinary PEM block: a single marker
+        # pair, nothing but whitespace outside it, and base64 that decodes to
+        # the end. The decoded body is the complete certificate PLUS ONE ZERO
+        # BYTE, so it is not exactly one certificate. inspect must not accept
+        # merely because a certificate parses from the start of the body:
+        # exit 1, empty stdout, invalid-certificate diagnostic naming the
+        # path -- and a content error, not a file read failure.
+        f=$FIXTURES/pem_body_trailing_nul.pem
+        decode_single_pem_body "$f" "$TMP/body.bin"
+        cert_size=$(wc -c <"$FIXTURES/valid.der")
+        body_size=$(wc -c <"$TMP/body.bin")
+        [ "$body_size" -eq $((cert_size + 1)) ] ||
+            fail "decoded body must be the certificate plus exactly one byte, got $body_size vs $cert_size"
+        cmp -s "$FIXTURES/valid.der" "$TMP/body.bin" &&
+            fail "test setup: decoded body must carry more than the certificate"
+        head -c "$cert_size" "$TMP/body.bin" | cmp -s "$FIXTURES/valid.der" - ||
+            fail "decoded body must start with the complete certificate"
+        last_byte=$(tail -c 1 "$TMP/body.bin" | od -An -tu1 | tr -d ' ')
+        [ "$last_byte" -eq 0 ] ||
+            fail "the single extra byte must be a zero byte, got $last_byte"
+        expect_invalid "$f"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "trailing body content is bad certificate content, not a read failure"
+        ;;
+
+    pem_body_trailing_cert)
+        # Same trap with a complete second certificate hidden in the one
+        # block's base64 body -- byte-identical to the first, which must still
+        # count as excess content: no "show the first and ignore the tail",
+        # and no read-failure classification.
+        f=$FIXTURES/pem_body_trailing_cert.pem
+        decode_single_pem_body "$f" "$TMP/body.bin"
+        cert_size=$(wc -c <"$FIXTURES/valid.der")
+        body_size=$(wc -c <"$TMP/body.bin")
+        [ "$body_size" -eq $((cert_size * 2)) ] ||
+            fail "decoded body must be two certificates, got $body_size vs $((cert_size * 2))"
+        head -c "$cert_size" "$TMP/body.bin" >"$TMP/body.first"
+        tail -c "$cert_size" "$TMP/body.bin" >"$TMP/body.second"
+        cmp -s "$TMP/body.first" "$FIXTURES/valid.der" ||
+            fail "first half of the body must be the complete certificate"
+        cmp -s "$TMP/body.second" "$FIXTURES/valid.der" ||
+            fail "second half must be another complete certificate"
+        cmp -s "$TMP/body.first" "$TMP/body.second" ||
+            fail "the hidden second certificate is meant to be identical to the first"
+        expect_invalid "$f"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "a second certificate in the PEM body is bad content, not a read failure"
+        ;;
+
+    pem_body_exact_with_whitespace)
+        # Adjacent success condition: a single block whose body IS exactly one
+        # complete certificate, with only supported spaces, tabs and blank
+        # lines (including CRLF) around it. It must display as PEM with the
+        # certificate's normal fields and the closing no-trust Note; the same
+        # certificate as DER must match in every field except Encoding.
+        {
+            printf ' \t  \n\n\t\n'
+            sed 's/$/\r/' "$FIXTURES/valid.pem"
+            printf '  \n\t \n\n  '
+        } >"$TMP/exact-body.pem"
+        decode_single_pem_body "$TMP/exact-body.pem" "$TMP/body.bin"
+        cmp -s "$TMP/body.bin" "$FIXTURES/valid.der" ||
+            fail "decoded body must be exactly the one certificate, no extra bytes"
+        write_expected_valid PEM "$TMP/expected"
+        expect_success "$TMP/exact-body.pem" "$TMP/expected"
+        "$BIN" inspect "$FIXTURES/valid.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        tail -n +2 "$TMP/expected" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM with surrounding whitespace and DER must agree outside Encoding"
+        head -n 1 "$TMP/expected" | grep -qx 'Encoding: PEM' ||
+            fail "the wrapped file must still report its real encoding as PEM"
+        grep -qF "$NOTE" "$TMP/expected" ||
+            fail "output must keep the no-trust-verification Note"
         ;;
 
     der_trailing_whitespace)

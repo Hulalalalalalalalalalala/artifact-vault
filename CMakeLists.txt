@@ -53,6 +53,9 @@ if(BUILD_TESTING)
         pem_second_block
         pem_text_before
         pem_text_after
+        pem_body_trailing_nul
+        pem_body_trailing_cert
+        pem_body_exact_with_whitespace
         der_trailing_whitespace
         der_trailing_cert
         der_trailing_bytes
