@@ -290,6 +290,94 @@ def main():
         long_oid_cert.public_bytes(serialization.Encoding.PEM)
     )
 
+    generate_time_fixtures()
+
+
+def generate_time_fixtures():
+    """Certificates pinning the validity-time display rules.
+
+    Kept separate from main()'s body so the time fixtures can be regenerated
+    on their own (``python3 -c "import generate_fixtures as g;
+    g.generate_time_fixtures()"``) without re-keying the other certificates.
+    """
+    import datetime
+
+    utc = datetime.timezone.utc
+
+    def time_name(common_name):
+        return x509.Name(
+            [
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+                x509.NameAttribute(
+                    NameOID.ORGANIZATION_NAME, "Trustpeek Test Org"
+                ),
+                x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+            ]
+        )
+
+    # UTCTime carries two-digit years; RFC 5280 reads 49 as 2049 and 50 as
+    # 1950. This certificate sits on both edges of that window at once, with
+    # non-zero hour/minute/second fields so the whole timestamp is pinned.
+    _, utctime = make_self_signed(
+        time_name("utctime.example.test"),
+        datetime.datetime(1950, 1, 2, 3, 4, 5, tzinfo=utc),
+        datetime.datetime(2049, 12, 31, 23, 59, 59, tzinfo=utc),
+        serial=0x1004,
+    )
+    utctime_der = utctime.public_bytes(serialization.Encoding.DER)
+    # Both validity fields must really be encoded as UTCTime (tag 0x17).
+    assert b"\x17\x0d500102030405Z" in utctime_der
+    assert b"\x17\x0d491231235959Z" in utctime_der
+    (FIXTURES / "utctime.der").write_bytes(utctime_der)
+    (FIXTURES / "utctime.pem").write_bytes(
+        utctime.public_bytes(serialization.Encoding.PEM)
+    )
+
+    # GeneralizedTime carries four-digit years; 2050 and beyond must print
+    # in full. 2096-02-29 is a real leap day. The certificate only becomes
+    # valid in 2050, so it also pins "not yet valid still displays, exit 0".
+    _, generalized = make_self_signed(
+        time_name("generalized.example.test"),
+        datetime.datetime(2050, 1, 1, 0, 0, 0, tzinfo=utc),
+        datetime.datetime(2096, 2, 29, 12, 34, 56, tzinfo=utc),
+        serial=0x1005,
+    )
+    generalized_der = generalized.public_bytes(serialization.Encoding.DER)
+    # Both validity fields must really be GeneralizedTime (tag 0x18).
+    assert b"\x18\x0f20500101000000Z" in generalized_der
+    assert b"\x18\x0f20960229123456Z" in generalized_der
+    (FIXTURES / "generalized.der").write_bytes(generalized_der)
+    (FIXTURES / "generalized.pem").write_bytes(
+        generalized.public_bytes(serialization.Encoding.PEM)
+    )
+
+    # One certificate mixing both encodings: UTCTime Not Before
+    # (2048-02-29, a valid leap day) and GeneralizedTime Not After
+    # (2050-03-01). Each output line must reflect its own field.
+    _, mixed = make_self_signed(
+        time_name("mixed.example.test"),
+        datetime.datetime(2048, 2, 29, 1, 2, 3, tzinfo=utc),
+        datetime.datetime(2050, 3, 1, 4, 5, 6, tzinfo=utc),
+        serial=0x1006,
+    )
+    mixed_der = mixed.public_bytes(serialization.Encoding.DER)
+    assert b"\x17\x0d480229010203Z" in mixed_der
+    assert b"\x18\x0f20500301040506Z" in mixed_der
+    (FIXTURES / "mixed.der").write_bytes(mixed_der)
+    (FIXTURES / "mixed.pem").write_bytes(
+        mixed.public_bytes(serialization.Encoding.PEM)
+    )
+
+    # A structurally complete certificate whose Not Before names a date
+    # that does not exist: 1950-02-30. Only the time digits are patched, so
+    # the DER structure, lengths and remaining fields stay intact; the file
+    # reads fine and must be rejected as invalid certificate CONTENT.
+    invalid_der = bytearray(utctime_der)
+    real_date = b"\x17\x0d500102030405Z"
+    assert invalid_der.count(real_date) == 1
+    invalid_der = invalid_der.replace(real_date, b"\x17\x0d500230030405Z")
+    (FIXTURES / "invalid-date.der").write_bytes(bytes(invalid_der))
+
 
 if __name__ == "__main__":
     main()

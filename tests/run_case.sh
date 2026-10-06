@@ -50,10 +50,22 @@ EXPIRED_FINGERPRINT=$(fingerprint_of "$FIXTURES/expired.der")
 MARKER_FINGERPRINT=$(fingerprint_of "$FIXTURES/marker.der")
 NAMES_FINGERPRINT=$(fingerprint_of "$FIXTURES/names.der")
 LONGOID_FINGERPRINT=$(fingerprint_of "$FIXTURES/longoid.der")
+UTCTIME_FINGERPRINT=$(fingerprint_of "$FIXTURES/utctime.der")
+GENERALIZED_FINGERPRINT=$(fingerprint_of "$FIXTURES/generalized.der")
+MIXED_FINGERPRINT=$(fingerprint_of "$FIXTURES/mixed.der")
 
 VALID_SUBJECT='C=CN, O=Trustpeek Test Org, OU=Engineering, CN=valid.example.test'
 EXPIRED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=expired.example.test'
 MARKER_SUBJECT='C=CN, O=Trustpeek Test Org, CN=marker -----BEGIN CERTIFICATE----- and -----END CERTIFICATE----- test'
+UTCTIME_SUBJECT='C=CN, O=Trustpeek Test Org, CN=utctime.example.test'
+GENERALIZED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=generalized.example.test'
+MIXED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=mixed.example.test'
+
+# DER tag+length prefixes of the two X.509 time encodings, used to prove a
+# fixture really carries the encoding a case is about (a bare ASCII grep
+# cannot tell "500102030405Z" apart from the tail of "19500102030405Z").
+UTCTIME_TAG=$(printf '\027\015')        # 0x17 0x0d: UTCTime, 13 chars
+GENERALIZED_TAG=$(printf '\030\017')    # 0x18 0x0f: GeneralizedTime, 15 chars
 
 # Subject and issuer of the deliberately non-self-signed complex-name
 # certificate (tests/fixtures/names.{pem,der}). Every attribute, its order,
@@ -127,6 +139,42 @@ write_expected_longoid() {  # $1 = encoding, $2 = output file
         printf 'Not Before: 2023-06-01T00:00:00Z\n'
         printf 'Not After: 2043-06-01T00:00:00Z\n'
         printf 'SHA-256 Fingerprint: %s\n' "$LONGOID_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+write_expected_utctime() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$UTCTIME_SUBJECT"
+        printf 'Issuer: %s\n' "$UTCTIME_SUBJECT"
+        printf 'Not Before: 1950-01-02T03:04:05Z\n'
+        printf 'Not After: 2049-12-31T23:59:59Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$UTCTIME_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+write_expected_generalized() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$GENERALIZED_SUBJECT"
+        printf 'Issuer: %s\n' "$GENERALIZED_SUBJECT"
+        printf 'Not Before: 2050-01-01T00:00:00Z\n'
+        printf 'Not After: 2096-02-29T12:34:56Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$GENERALIZED_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+write_expected_mixed() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$MIXED_SUBJECT"
+        printf 'Issuer: %s\n' "$MIXED_SUBJECT"
+        printf 'Not Before: 2048-02-29T01:02:03Z\n'
+        printf 'Not After: 2050-03-01T04:05:06Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$MIXED_FINGERPRINT"
         printf '%s\n' "$NOTE"
     } >"$2"
 }
@@ -435,6 +483,117 @@ case "$CASE" in
             fail "fixture should be self-signed (subject == issuer)"
         grep -qF "$NOTE" "$TMP/stdout" ||
             fail "output must keep the no-trust-verification Note"
+        ;;
+
+    utctime_year_boundaries)
+        # UTCTime carries two-digit years: per RFC 5280, year 49 means 2049
+        # and year 50 means 1950. The fixture sits on both edges of that
+        # window at once, with non-zero hour/minute/second fields, so the
+        # whole YYYY-MM-DDTHH:MM:SSZ rendering is pinned.
+        LC_ALL=C grep -qF "$UTCTIME_TAG"'500102030405Z' "$FIXTURES/utctime.der" ||
+            fail "fixture no longer carries Not Before as UTCTime 1950-01-02T03:04:05Z"
+        LC_ALL=C grep -qF "$UTCTIME_TAG"'491231235959Z' "$FIXTURES/utctime.der" ||
+            fail "fixture no longer carries Not After as UTCTime 2049-12-31T23:59:59Z"
+        write_expected_utctime DER "$TMP/expected"
+        expect_success "$FIXTURES/utctime.der" "$TMP/expected"
+        ;;
+
+    generalized_time_full_year)
+        # GeneralizedTime carries four-digit years: 2050 and beyond must
+        # print in full, and 2096-02-29 is a real leap day that must display
+        # as-is. The certificate only becomes valid in 2050, so this also
+        # pins "not yet valid still displays and exits 0".
+        LC_ALL=C grep -qF "$GENERALIZED_TAG"'20500101000000Z' "$FIXTURES/generalized.der" ||
+            fail "fixture no longer carries Not Before as GeneralizedTime 2050-01-01T00:00:00Z"
+        LC_ALL=C grep -qF "$GENERALIZED_TAG"'20960229123456Z' "$FIXTURES/generalized.der" ||
+            fail "fixture no longer carries Not After as GeneralizedTime 2096-02-29T12:34:56Z"
+        write_expected_generalized DER "$TMP/expected"
+        expect_success "$FIXTURES/generalized.der" "$TMP/expected"
+        ;;
+
+    mixed_time_formats)
+        # One certificate whose Not Before is UTCTime (2048-02-29, a valid
+        # leap day) and whose Not After is GeneralizedTime (2050-03-01):
+        # each output line must show its own field's recorded moment, not a
+        # swapped line and not one year rule applied to both.
+        LC_ALL=C grep -qF "$UTCTIME_TAG"'480229010203Z' "$FIXTURES/mixed.der" ||
+            fail "fixture no longer carries Not Before as UTCTime 2048-02-29T01:02:03Z"
+        LC_ALL=C grep -qF "$GENERALIZED_TAG"'20500301040506Z' "$FIXTURES/mixed.der" ||
+            fail "fixture no longer carries Not After as GeneralizedTime 2050-03-01T04:05:06Z"
+        write_expected_mixed PEM "$TMP/expected"
+        expect_success "$FIXTURES/mixed.pem" "$TMP/expected"
+        # The byte-for-byte comparison above already pins both lines; state
+        # the anti-swap expectation explicitly as well.
+        sed -n 's/^Not Before: //p' "$TMP/stdout" | grep -qx '2048-02-29T01:02:03Z' ||
+            fail "Not Before must show the UTCTime moment 2048-02-29T01:02:03Z"
+        sed -n 's/^Not After: //p' "$TMP/stdout" | grep -qx '2050-03-01T04:05:06Z' ||
+            fail "Not After must show the GeneralizedTime moment 2050-03-01T04:05:06Z"
+        ;;
+
+    pem_der_mixed_time_same)
+        # The mixed-encoding certificate saved as PEM and as DER: Encoding
+        # reports the real format, the validity times and every other field
+        # agree verbatim between the two runs.
+        "$BIN" inspect "$FIXTURES/mixed.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/mixed.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree on validity times or other fields"
+        ;;
+
+    timezone_independent_output)
+        # Validity times are printed in UTC and must not move with the local
+        # timezone, even where the local rendering would cross a date or
+        # year boundary: utctime.pem's Not After 2049-12-31T23:59:59Z is
+        # already 2050-01-01 in UTC+14, and generalized.pem's Not Before
+        # 2050-01-01T00:00:00Z is still 2049-12-31 in UTC-12. AAA12/BBB-14
+        # are POSIX TZ strings (hours west of Greenwich), so no tzdata is
+        # needed; skip only if `date` cannot confirm the offsets took hold.
+        if [ "$(TZ=UTC0 date -d @0 '+%H' 2>/dev/null)" != "00" ] ||
+           [ "$(TZ=AAA12 date -d @0 '+%H' 2>/dev/null)" != "12" ] ||
+           [ "$(TZ=BBB-14 date -d @0 '+%H' 2>/dev/null)" != "14" ]; then
+            echo "PASS: $CASE (skipped: cannot steer local timezone via TZ)"
+            exit 0
+        fi
+        for fixture in utctime generalized; do
+            write_expected_"$fixture" PEM "$TMP/expected"
+            for tz in UTC0 AAA12 BBB-14; do
+                TZ=$tz "$BIN" inspect "$FIXTURES/$fixture.pem" \
+                    >"$TMP/stdout" 2>"$TMP/stderr"
+                rc=$?
+                [ "$rc" -eq 0 ] || fail "TZ=$tz: expected exit 0, got $rc"
+                [ -s "$TMP/stderr" ] &&
+                    fail "TZ=$tz: expected empty stderr, got: $(cat "$TMP/stderr")"
+                cmp -s "$TMP/expected" "$TMP/stdout" ||
+                    fail "TZ=$tz changed the UTC validity output of $fixture.pem"
+            done
+        done
+        ;;
+
+    invalid_date_rejected)
+        # The certificate is complete and readable, but its Not Before is
+        # 1950-02-30, a date that does not exist. That is a certificate
+        # CONTENT error (invalid certificate, exit 1, empty stdout), never
+        # a read failure.
+        LC_ALL=C grep -qF "$UTCTIME_TAG"'500230030405Z' "$FIXTURES/invalid-date.der" ||
+            fail "fixture lost its impossible Not Before date 1950-02-30"
+        expect_invalid "$FIXTURES/invalid-date.der"
+        if grep -q "failed to read file" "$TMP/stderr"; then
+            fail "impossible date must not be reported as a read failure: $(cat "$TMP/stderr")"
+        fi
+        grep -q "failed to parse certificate fields" "$TMP/stderr" ||
+            fail "stderr should pinpoint the unparseable validity field, got: $(cat "$TMP/stderr")"
         ;;
 
     der_marker_in_name)

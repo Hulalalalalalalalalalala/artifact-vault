@@ -19,6 +19,12 @@ if(BUILD_TESTING)
         pem_surrounding_whitespace
         expired_ok
         self_signed_ok
+        utctime_year_boundaries
+        generalized_time_full_year
+        mixed_time_formats
+        pem_der_mixed_time_same
+        timezone_independent_output
+        invalid_date_rejected
         der_marker_in_name
         pem_marker_in_name
         der_complex_names
