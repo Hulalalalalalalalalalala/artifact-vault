@@ -123,14 +123,23 @@ def replace_validity(der, not_before_tlv, not_after_tlv):
     return der_tlv(0x30, rebuilt)
 
 
-def pem_from_der(der):
-    encoded = base64.b64encode(der).decode("ascii")
+def pem_from_body(body):
+    # Single CERTIFICATE block whose base64 payload decodes to exactly `body`
+    # (canonical padding, folded at 64 columns). Unlike pem_from_der the body
+    # need not be one certificate DER: this is how the body-integrity fixtures
+    # below hide extra content behind a certificate that parses from the
+    # payload's start.
+    encoded = base64.b64encode(body).decode("ascii")
     lines = [encoded[i:i + 64] for i in range(0, len(encoded), 64)]
     return (
         "-----BEGIN CERTIFICATE-----\n"
         + "\n".join(lines)
         + "\n-----END CERTIFICATE-----\n"
     ).encode("ascii")
+
+
+def pem_from_der(der):
+    return pem_from_body(der)
 
 
 def write_cert_pair(stem, der):
@@ -582,6 +591,29 @@ def main():
         generalized_time_tlv("20500230000000Z"),
     )
     write_cert_pair("baddate", baddate_der)
+
+    # --- PEM body-integrity fixtures ------------------------------------
+    #
+    # Each file looks like exactly one PEM CERTIFICATE block: the begin/end
+    # markers are intact and correctly placed, nothing but a trailing newline
+    # sits outside the block, and the base64 body decodes COMPLETELY with
+    # canonical padding (no truncation, no invalid characters). What is wrong
+    # is purely that the decoded payload is not exactly one certificate DER:
+    # a certificate parses from the payload's start, but the body still hides
+    # surplus bytes. A reader that reports success as soon as it parses that
+    # first certificate would wrongly accept these, so inspect must reject
+    # both as invalid certificate CONTENT (never as a read failure).
+    #
+    # A complete certificate followed by a single zero byte:
+    (FIXTURES / "pembody_trailing_nul.pem").write_bytes(
+        pem_from_body(der + b"\x00")
+    )
+    # A complete certificate followed by another COMPLETE certificate. The
+    # second certificate is byte-for-byte identical to the first; an identical
+    # twin is still surplus content and must not be displayed or ignored.
+    (FIXTURES / "pembody_trailing_cert.pem").write_bytes(
+        pem_from_body(der + der)
+    )
 
 
 if __name__ == "__main__":

@@ -56,6 +56,8 @@ if(BUILD_TESTING)
         der_trailing_whitespace
         der_trailing_cert
         der_trailing_bytes
+        pem_body_trailing_nul
+        pem_body_trailing_cert
         public_key_only
         private_key_only
         read_directory

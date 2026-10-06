@@ -533,6 +533,54 @@ expect_invalid() {
         fail "stderr should name the input path '$file', got: $(cat "$TMP/stderr")"
 }
 
+# Proves a PEM rejection fixture fails on HIDDEN PAYLOAD CONTENT rather than
+# on a packaging defect. $1 = fixture, $2 = expected surplus byte count. The
+# file must contain exactly one CERTIFICATE block whose exterior is only
+# supported whitespace (space/tab/CR/LF), and its base64 body must be the
+# canonical, FULL encoding (complete decode, no truncation or stray padding)
+# of the complete valid certificate DER followed by exactly $2 surplus
+# bytes. A regression in how the body is read therefore cannot be hidden by
+# a broken marker, outside-block text or an encoding error.
+assert_pem_hidden_content_shape() {
+    fixture=$1
+    surplus=$2
+    if ! python3 - "$fixture" "$FIXTURES/valid.der" "$surplus" <<'EOF'
+import base64
+import re
+import sys
+
+fixture, der_path, surplus = sys.argv[1], sys.argv[2], int(sys.argv[3])
+raw = open(fixture, "rb").read()
+der = open(der_path, "rb").read()
+begin = b"-----BEGIN CERTIFICATE-----"
+end = b"-----END CERTIFICATE-----"
+
+assert raw.count(begin) == 1 and raw.count(end) == 1, \
+    "must contain exactly one begin and one end marker"
+match = re.fullmatch(
+    rb"[ \t\r\n]*" + re.escape(begin) + rb"\r?\n(.*?)"
+    + re.escape(end) + rb"\r?\n?[ \t\r\n]*", raw, re.S)
+assert match, "markers must be intact with only whitespace outside the block"
+
+body = b"".join(line.strip() for line in match.group(1).splitlines())
+assert body and len(body) % 4 == 0, "base64 body must be a complete multiple of four"
+assert re.fullmatch(rb"[A-Za-z0-9+/]*={0,2}", body), \
+    "base64 body must contain only base64 characters and terminal padding"
+# validate=True rejects non-alphabet/garbage; re-encoding the decoded bytes
+# must reproduce the body exactly, proving the decode is complete and the
+# padding is canonical (nothing is cut off, no padding hides data).
+decoded = base64.b64decode(body, validate=True)
+assert base64.b64encode(decoded) == body, "base64 body must decode completely and canonically"
+
+assert decoded[:len(der)] == der, "payload must begin with the complete valid certificate DER"
+assert len(decoded) - len(der) == surplus and surplus > 0, \
+    f"payload must hide exactly {surplus} surplus bytes beyond the one certificate"
+EOF
+    then
+        fail "fixture '$fixture' lacks the intended single-block, fully-decoded cert-plus-surplus shape"
+    fi
+}
+
 # Asserts an already-finished run ($rc, $TMP/stdout, $TMP/stderr) is a file
 # READ failure: exit 1, empty stdout, a stderr diagnostic distinct from
 # invalid-certificate content that names the path and carries a real reason
@@ -634,6 +682,21 @@ case "$CASE" in
         } >"$TMP/whitespace.pem"
         write_expected_valid PEM "$TMP/expected"
         expect_success "$TMP/whitespace.pem" "$TMP/expected"
+        # The surrounding whitespace must not alter any field: the same
+        # certificate saved directly as DER reports DER but matches this PEM
+        # run on subject, issuer, both UTC times, fingerprint and the Note.
+        "$BIN" inspect "$FIXTURES/valid.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/expected" | grep -qx 'Encoding: PEM' ||
+            fail "whitespace-wrapped PEM must still be reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/expected" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "whitespace-wrapped PEM and DER runs disagree outside the Encoding line"
         ;;
 
     expired_ok)
@@ -1074,6 +1137,48 @@ case "$CASE" in
     der_trailing_bytes)
         { cat "$FIXTURES/valid.der"; printf '\000\001\002'; } >"$TMP/trailing.der"
         expect_invalid "$TMP/trailing.der"
+        ;;
+
+    pem_body_trailing_nul)
+        # The file looks like exactly one PEM CERTIFICATE block -- one pair
+        # of intact markers, only whitespace outside the block, and a base64
+        # body that decodes completely -- but the decoded payload is the
+        # complete certificate DER plus a single zero byte. A reader that
+        # accepts as soon as a certificate parses from the body's start would
+        # wrongly succeed: the surplus NUL must make this invalid certificate
+        # content, exit 1, empty stdout, never a read failure.
+        fixture=$FIXTURES/pembody_trailing_nul.pem
+        assert_pem_hidden_content_shape "$fixture" 1
+        expect_invalid "$fixture"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "hidden payload content is bad certificate content, not a read failure"
+        ;;
+
+    pem_body_trailing_cert)
+        # Same single-block, fully-decodable packaging, but the payload is a
+        # complete certificate followed by another COMPLETE certificate --
+        # byte-for-byte identical to the first. The identical twin is still
+        # surplus content: inspect must neither show only the first and
+        # ignore the tail nor treat this as a file read failure.
+        fixture=$FIXTURES/pembody_trailing_cert.pem
+        cert_size=$(wc -c <"$FIXTURES/valid.der")
+        assert_pem_hidden_content_shape "$fixture" "$cert_size"
+        expect_invalid "$fixture"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "hidden payload content is bad certificate content, not a read failure"
+        # The second certificate really is the same bytes as the first, so
+        # the fixture cannot sneak by as "two distinct certificates" logic.
+        python3 - "$fixture" "$FIXTURES/valid.der" <<'EOF' || fail "fixture setup: payload must be two identical certificates"
+import base64
+import re
+import sys
+raw = open(sys.argv[1], "rb").read()
+der = open(sys.argv[2], "rb").read()
+body = b"".join(re.search(rb"-----BEGIN CERTIFICATE-----\n(.*?)-----END",
+                          raw, re.S).group(1).split())
+payload = base64.b64decode(body, validate=True)
+assert payload == der + der
+EOF
         ;;
 
     public_key_only)
