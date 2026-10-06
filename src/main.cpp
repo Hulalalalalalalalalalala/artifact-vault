@@ -452,8 +452,27 @@ int inspect_file(const std::string& path) {
             return 1;
         }
     } else {
-        BioPtr bio(BIO_new_mem_buf(content.data(),
-                                  static_cast<int>(content.size())),
+        // OpenSSL's PEM reader only recognizes the BEGIN marker at the
+        // very start of a line, so whitespace hugging the marker on its
+        // own line (e.g. "  -----BEGIN CERTIFICATE-----") would hide the
+        // block even though whitespace before the begin marker and after
+        // the end marker is allowed. Parse the marker-to-marker block
+        // itself; whether the file holds exactly one block with nothing
+        // but whitespace around it is decided by validate_single_pem()
+        // below, not by this parse.
+        std::string_view pem_view(content);
+        size_t block_begin = content.find(kPemBegin);
+        if (block_begin != std::string::npos) {
+            size_t block_end =
+                content.find(kPemEnd, block_begin + kPemBegin.size());
+            if (block_end != std::string::npos) {
+                pem_view = pem_view.substr(
+                    block_begin,
+                    block_end + kPemEnd.size() - block_begin);
+            }
+        }
+        BioPtr bio(BIO_new_mem_buf(pem_view.data(),
+                                  static_cast<int>(pem_view.size())),
                    BIO_free_all);
         if (!bio) {
             std::cerr << "trustpeek: internal error while reading '" << path

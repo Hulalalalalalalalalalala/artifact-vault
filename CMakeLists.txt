@@ -56,6 +56,9 @@ if(BUILD_TESTING)
         pem_body_trailing_nul
         pem_body_trailing_cert
         pem_body_exact_with_whitespace
+        pem_whitespace_hugging_markers
+        pem_whitespace_hugging_second_block
+        pem_whitespace_hugging_text_outside
         der_trailing_whitespace
         der_trailing_cert
         der_trailing_bytes

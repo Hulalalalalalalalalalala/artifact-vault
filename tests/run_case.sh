@@ -1169,6 +1169,66 @@ case "$CASE" in
             fail "output must keep the no-trust-verification Note"
         ;;
 
+    pem_whitespace_hugging_markers)
+        # The outer whitespace may also hug the markers on their own lines:
+        # spaces and tabs directly before the BEGIN marker and directly
+        # after the END marker, mixed with whitespace-only lines and CRLF
+        # endings, and the file need not end with a newline. The certificate
+        # content is untouched, so the output must match the plain PEM run
+        # verbatim and the DER run in every field except Encoding.
+        sed 's/$/\r/' "$FIXTURES/valid.pem" | head -c -2 >"$TMP/block.pem"
+        {
+            printf ' \t\n\t\n'
+            printf '  \t'
+            cat "$TMP/block.pem"
+            printf ' \t\n'
+            printf '\t \n  \t'
+        } >"$TMP/hugging.pem"
+        write_expected_valid PEM "$TMP/expected"
+        expect_success "$TMP/hugging.pem" "$TMP/expected"
+        "$BIN" inspect "$FIXTURES/valid.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        tail -n +2 "$TMP/expected" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM with hugging whitespace and DER must agree outside Encoding"
+        head -n 1 "$TMP/expected" | grep -qx 'Encoding: PEM' ||
+            fail "the wrapped file must still report its real encoding as PEM"
+        grep -qF "$NOTE" "$TMP/expected" ||
+            fail "output must keep the no-trust-verification Note"
+        ;;
+
+    pem_whitespace_hugging_second_block)
+        # The outer-whitespace allowance does not extend to a second
+        # certificate block, even one byte-identical to the first.
+        {
+            printf '  \t'
+            cat "$FIXTURES/valid.pem"
+            printf '\t \n  '
+            cat "$FIXTURES/valid.pem"
+            printf ' \t'
+        } >"$TMP/two-hugging.pem"
+        expect_invalid "$TMP/two-hugging.pem"
+        ;;
+
+    pem_whitespace_hugging_text_outside)
+        # Any non-whitespace text outside the block stays a content error,
+        # before or after, even when the whitespace itself hugs the markers.
+        {
+            printf 'see also: https://example.test\n  \t'
+            cat "$FIXTURES/valid.pem"
+        } >"$TMP/text-before-hugging.pem"
+        expect_invalid "$TMP/text-before-hugging.pem"
+        {
+            printf '\t  '
+            head -c -1 "$FIXTURES/valid.pem"
+            printf '  \t\ntrailing comment\n'
+        } >"$TMP/text-after-hugging.pem"
+        expect_invalid "$TMP/text-after-hugging.pem"
+        ;;
+
     der_trailing_whitespace)
         # DER gets no textual-whitespace allowance: even one trailing
         # whitespace byte after a complete certificate is rejected.
