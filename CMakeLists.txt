@@ -77,6 +77,26 @@ if(BUILD_TESTING)
         der_control_chars
         pem_control_chars
         pem_der_control_chars_same
+        der_names_enc_utf8
+        pem_names_enc_utf8
+        der_names_enc_bmp
+        pem_names_enc_bmp
+        der_names_enc_universal
+        pem_names_enc_universal
+        names_enc_three_agree
+        der_nameenc_cross
+        pem_nameenc_cross
+        pem_der_nameenc_cross_same
+        der_nameenc_nul
+        pem_nameenc_nul
+        pem_der_nameenc_nul_same
+        der_nameenc_supplementary
+        pem_nameenc_supplementary
+        pem_der_nameenc_supplementary_same
+        namebad_bmp_der
+        namebad_bmp_pem
+        namebad_universal_der
+        namebad_universal_pem
         time_century_utc_der
         time_century_utc_pem
         time_pivot_49_and_50

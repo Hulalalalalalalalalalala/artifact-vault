@@ -132,6 +132,123 @@ def replace_validity(der, not_before_tlv, not_after_tlv):
     return der_tlv(0x30, rebuilt)
 
 
+# --- DER surgery for DirectoryString name-value encodings ----------------
+#
+# The certificate builder only emits UTF8String (tag 0x0C) name values. X.509
+# DirectoryString also permits BMPString (tag 0x1E, 16-bit big-endian UCS-2
+# code units) and UniversalString (tag 0x1C, 32-bit big-endian UCS-4 code
+# units) for the same text. inspect must turn all three encodings of one
+# text into the same UTF-8. The builder API cannot select those tags, so the
+# subject/issuer Name SEQUENCEs are rewritten in DER after signing. The
+# rewritten signature is cryptographically invalid, which is irrelevant:
+# inspect never verifies signatures and must display these certificates like
+# any other. Two rewritten values deliberately hold a structurally malformed
+# string (an odd BMPString length; a UniversalString length that is not a
+# multiple of four) to pin the invalid-certificate rejection.
+
+TAG_UTF8_STRING = 0x0C
+TAG_BMP_STRING = 0x1E
+TAG_UNIVERSAL_STRING = 0x1C
+
+
+def encode_oid_bytes(oid):
+    arcs = [int(arc) for arc in oid.dotted_string.split(".")]
+    encoded = bytearray([arcs[0] * 40 + arcs[1]])
+    for arc in arcs[2:]:
+        chunks = [arc & 0x7F]
+        arc >>= 7
+        while arc:
+            chunks.append((arc & 0x7F) | 0x80)
+            arc >>= 7
+        encoded.extend(reversed(chunks))
+    return bytes(encoded)
+
+
+def bmp_string_content(text):
+    # One 16-bit big-endian UCS-2 code unit per character. The BMP fixtures
+    # only use BMP-representable text; supplementary characters are covered
+    # via UniversalString (and UTF8String), never encoded as BMP surrogates.
+    return b"".join(ord(ch).to_bytes(2, "big") for ch in text)
+
+
+def universal_string_content(text):
+    # One 32-bit big-endian UCS-4 code unit per character, covering the whole
+    # Unicode range including supplementary-plane characters.
+    return b"".join(ord(ch).to_bytes(4, "big") for ch in text)
+
+
+def name_value(oid, encoding, text):
+    """Build an (oid, tag, content) DirectoryString attribute value."""
+    if encoding == "utf8":
+        return (oid, TAG_UTF8_STRING, text.encode("utf-8"))
+    if encoding == "bmp":
+        assert all(ord(ch) <= 0xFFFF for ch in text), text
+        return (oid, TAG_BMP_STRING, bmp_string_content(text))
+    if encoding == "universal":
+        return (oid, TAG_UNIVERSAL_STRING, universal_string_content(text))
+    raise ValueError(f"unknown name value encoding: {encoding!r}")
+
+
+def name_attribute_tlv(oid, tag, content):
+    return der_tlv(
+        0x30, der_tlv(0x06, encode_oid_bytes(oid)) + der_tlv(tag, content)
+    )
+
+
+def single_rdn_name(attributes):
+    """Name content with each attribute tuple in its own (single) RDN SET."""
+    return [[attribute] for attribute in attributes]
+
+
+def name_content(rdns):
+    """Content bytes of an X.501 Name SEQUENCE.
+
+    rdns is a list of RDNs; each RDN is a list of (oid, tag, content)
+    attributes that share one SET (a multi-valued RDN).
+    """
+    parts = []
+    for attributes in rdns:
+        parts.append(
+            der_tlv(0x31, b"".join(
+                name_attribute_tlv(*attribute) for attribute in attributes))
+        )
+    return b"".join(parts)
+
+
+def replace_names(der, subject_content, issuer_content):
+    """Rewrite both Name SEQUENCE contents of an already-signed certificate.
+
+    The issuer Name is the fourth tbsCertificate element and the subject Name
+    the sixth (right after/around the validity), accounting for the optional
+    explicit-version [0] wrapper. Only the two Name SEQUENCEs change; the
+    outer certificate stays a complete Certificate with its signature intact
+    structurally.
+    """
+    outer = iter_der_elements(der)
+    assert len(outer) == 1 and outer[0][0] == 0x30
+    cert_children = iter_der_elements(outer[0][1])
+    tbs_children = iter_der_elements(cert_children[0][1])
+    first = 1 if tbs_children[0][0] == 0xA0 else 0
+    issuer_index = first + 2   # serial, signature algorithm, then issuer
+    subject_index = first + 4  # issuer, validity, then subject
+    assert tbs_children[issuer_index][0] == 0x30
+    assert tbs_children[subject_index][0] == 0x30
+    rewritten = (
+        tbs_children[:issuer_index]
+        + [(0x30, issuer_content)]
+        + tbs_children[issuer_index + 1:subject_index]
+        + [(0x30, subject_content)]
+        + tbs_children[subject_index + 1:]
+    )
+    rewritten_tbs = der_tlv(
+        0x30, b"".join(der_tlv(t, c) for t, c in rewritten)
+    )
+    rebuilt = rewritten_tbs + b"".join(
+        der_tlv(t, c) for t, c in cert_children[1:]
+    )
+    return der_tlv(0x30, rebuilt)
+
+
 def pem_from_der(der):
     encoded = base64.b64encode(der).decode("ascii")
     lines = [encoded[i:i + 64] for i in range(0, len(encoded), 64)]
@@ -288,6 +405,220 @@ def write_ctrlchars_fixtures():
         .sign(ctrl_issuer_key, hashes.SHA256())
     )
     write_cert_pem("ctrlchars", ctrl_cert.public_bytes(serialization.Encoding.DER))
+
+
+# The same name text expressed in the three DirectoryString encodings the
+# regression compares: Chinese, accented Latin letters and plain ASCII, all
+# representable by BMPString as well as the other two (no supplementary-plane
+# character here, so BMPString is on equal footing).
+ENC_ORG = "示例科技CaféOne"
+ENC_OU = "研发部NaïveGroup"
+ENC_CN = "用户Renée01"
+
+
+def country_name_attribute():
+    # countryName is a PrintableString (tag 0x13), not a DirectoryString.
+    return (NameOID.COUNTRY_NAME, 0x13, b"CN")
+
+
+def write_name_string_encoding_fixtures():
+    """PEM fixtures pinning UTF8String/BMPString/UniversalString name display.
+
+    All but the two deliberately malformed certificates are self-contained
+    complete certificates; their signatures are cryptographically invalid
+    after the name surgery, which inspect never checks. The set:
+
+      namesenc_utf8 / namesenc_bmp / namesenc_universal
+          One self-signed base certificate (same key, serial, validity) whose
+          subject and issuer carry the same text re-tagged as UTF8String,
+          BMPString and UniversalString. BMP/Universal encodings of ordinary
+          characters contain zero bytes (e.g. "中" -> 00 4D...), which must
+          NOT surface as NUL escapes. All three render verbatim identically.
+      nameenc_cross
+          Subject values are BMPString while issuer values are UTF8String and
+          the two names carry DIFFERENT text, so a render that lets one field
+          leak into the other is caught.
+      nameenc_nul
+          The same value containing a REAL NUL ("中\\x00文Aé") is a BMPString
+          in the subject and a UniversalString in the issuer; both must show
+          the visible \\00 escape with the following text kept, while the
+          zero bytes those wide encodings use for ordinary characters stay
+          invisible. Each name adds its own NUL-bearing CN.
+      nameenc_supplementary
+          A supplementary-plane character (😀) shared by a UTF8String subject
+          and a UniversalString issuer; both must show the character whole.
+      namebad_bmp / namebad_universal
+          Structurally complete certificates whose subject carries a
+          BMPString with an odd content length, or a UniversalString whose
+          content length is not a multiple of four. Both are certificate
+          CONTENT errors: exit 1, "invalid certificate" naming the path,
+          empty stdout, for PEM and DER alike.
+    """
+    import datetime
+
+    utc = datetime.timezone.utc
+
+    def common_attributes(encoding):
+        return [
+            country_name_attribute(),
+            name_value(NameOID.ORGANIZATION_NAME, encoding, ENC_ORG),
+            name_value(NameOID.ORGANIZATIONAL_UNIT_NAME, encoding, ENC_OU),
+            name_value(NameOID.COMMON_NAME, encoding, ENC_CN),
+        ]
+
+    # One base certificate; only the name value tags differ between the
+    # variants, so key material, serial and validity stay identical.
+    common_name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, ENC_ORG),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, ENC_OU),
+            x509.NameAttribute(NameOID.COMMON_NAME, ENC_CN),
+        ]
+    )
+    _, enc_base = make_self_signed(
+        common_name,
+        datetime.datetime(2024, 3, 1, tzinfo=utc),
+        datetime.datetime(2044, 3, 1, tzinfo=utc),
+        serial=0x6001,
+    )
+    enc_der = enc_base.public_bytes(serialization.Encoding.DER)
+    write_cert_pem("namesenc_utf8", enc_der)
+    bmp_content = name_content(single_rdn_name(common_attributes("bmp")))
+    write_cert_pem(
+        "namesenc_bmp", replace_names(enc_der, bmp_content, bmp_content)
+    )
+    universal_content = name_content(
+        single_rdn_name(common_attributes("universal"))
+    )
+    write_cert_pem(
+        "namesenc_universal",
+        replace_names(enc_der, universal_content, universal_content),
+    )
+
+    # Subject (BMPString) and issuer (UTF8String) carry different text, so
+    # the two lines must not borrow each other's values.
+    placeholder = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, "placeholder")]
+    )
+    cross_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    cross_base = (
+        x509.CertificateBuilder()
+        .subject_name(placeholder)
+        .issuer_name(placeholder)
+        .public_key(cross_key.public_key())
+        .serial_number(0x6002)
+        .not_valid_before(datetime.datetime(2024, 4, 1, tzinfo=utc))
+        .not_valid_after(datetime.datetime(2044, 4, 1, tzinfo=utc))
+        .sign(cross_key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.DER)
+    )
+    cross_subject = name_content(single_rdn_name([
+        country_name_attribute(),
+        name_value(NameOID.ORGANIZATION_NAME, "bmp", "主体公司Subject"),
+        name_value(NameOID.ORGANIZATIONAL_UNIT_NAME, "bmp", "终端部门EndEntity"),
+        name_value(NameOID.COMMON_NAME, "bmp", "最终用户UserBMP"),
+    ]))
+    cross_issuer = name_content(single_rdn_name([
+        country_name_attribute(),
+        name_value(NameOID.ORGANIZATION_NAME, "utf8", "颁发机构Issuer"),
+        name_value(NameOID.COMMON_NAME, "utf8", "根CA-Root"),
+    ]))
+    write_cert_pem(
+        "nameenc_cross", replace_names(cross_base, cross_subject, cross_issuer)
+    )
+
+    # A real NUL in the middle of a value: BMPString subject vs UniversalString
+    # issuer for the shared organization value, plus a distinct NUL-bearing CN
+    # on each side. The wide encodings' structural zero bytes must never be
+    # mistaken for the NUL.
+    nul_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    nul_base = (
+        x509.CertificateBuilder()
+        .subject_name(placeholder)
+        .issuer_name(placeholder)
+        .public_key(nul_key.public_key())
+        .serial_number(0x6003)
+        .not_valid_before(datetime.datetime(2024, 5, 1, tzinfo=utc))
+        .not_valid_after(datetime.datetime(2044, 5, 1, tzinfo=utc))
+        .sign(nul_key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.DER)
+    )
+    nul_shared = "中\x00文Aé"
+    nul_subject = name_content(single_rdn_name([
+        country_name_attribute(),
+        name_value(NameOID.ORGANIZATION_NAME, "bmp", nul_shared),
+        name_value(NameOID.COMMON_NAME, "bmp", "主体\x00Nul"),
+    ]))
+    nul_issuer = name_content(single_rdn_name([
+        country_name_attribute(),
+        name_value(NameOID.ORGANIZATION_NAME, "universal", nul_shared),
+        name_value(NameOID.COMMON_NAME, "universal", "颁发\x00Root"),
+    ]))
+    write_cert_pem(
+        "nameenc_nul", replace_names(nul_base, nul_subject, nul_issuer)
+    )
+
+    # Supplementary-plane character: UTF8String subject, UniversalString
+    # issuer, the same whole value on both lines.
+    supplementary_text = "Smile😀笑"
+    sup_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    sup_base = (
+        x509.CertificateBuilder()
+        .subject_name(placeholder)
+        .issuer_name(placeholder)
+        .public_key(sup_key.public_key())
+        .serial_number(0x6004)
+        .not_valid_before(datetime.datetime(2024, 6, 1, tzinfo=utc))
+        .not_valid_after(datetime.datetime(2044, 6, 1, tzinfo=utc))
+        .sign(sup_key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.DER)
+    )
+    sup_subject = name_content(single_rdn_name([
+        country_name_attribute(),
+        name_value(NameOID.COMMON_NAME, "utf8", supplementary_text),
+    ]))
+    sup_issuer = name_content(single_rdn_name([
+        country_name_attribute(),
+        name_value(NameOID.COMMON_NAME, "universal", supplementary_text),
+    ]))
+    write_cert_pem(
+        "nameenc_supplementary",
+        replace_names(sup_base, sup_subject, sup_issuer),
+    )
+
+    # Malformed name strings on otherwise complete certificates: an odd
+    # BMPString length ("中" = 4E 2D plus one stray 0x65) and a
+    # UniversalString length of 6 (one complete code unit plus half of one).
+    bad_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    good_issuer_content = name_content(single_rdn_name([
+        country_name_attribute(),
+        name_value(NameOID.COMMON_NAME, "utf8", "good issuer"),
+    ]))
+    bad_specs = [
+        ("namebad_bmp", TAG_BMP_STRING, b"\x4e\x2d\x65"),
+        ("namebad_universal", TAG_UNIVERSAL_STRING,
+         b"\x00\x00\x4e\x2d\x00\x00"),
+    ]
+    for stem, tag, raw_content in bad_specs:
+        bad_base = (
+            x509.CertificateBuilder()
+            .subject_name(placeholder)
+            .issuer_name(placeholder)
+            .public_key(bad_key.public_key())
+            .serial_number(0x6005)
+            .not_valid_before(datetime.datetime(2024, 7, 1, tzinfo=utc))
+            .not_valid_after(datetime.datetime(2044, 7, 1, tzinfo=utc))
+            .sign(bad_key, hashes.SHA256())
+            .public_bytes(serialization.Encoding.DER)
+        )
+        bad_subject = name_content(single_rdn_name([
+            country_name_attribute(),
+            (NameOID.COMMON_NAME, tag, raw_content),
+        ]))
+        write_cert_pem(
+            stem, replace_names(bad_base, bad_subject, good_issuer_content)
+        )
 
 
 def main():
@@ -516,6 +847,7 @@ def main():
     )
 
     write_ctrlchars_fixtures()
+    write_name_string_encoding_fixtures()
 
     # --- Validity-time fixtures -----------------------------------------
     #

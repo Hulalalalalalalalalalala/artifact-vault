@@ -85,6 +85,12 @@ MARKER_FINGERPRINT=$(fingerprint_of "$FIXTURES/marker.der")
 NAMES_FINGERPRINT=$(fingerprint_of "$FIXTURES/names.der")
 LONGOID_FINGERPRINT=$(fingerprint_of "$FIXTURES/longoid.der")
 CTRLCHARS_FINGERPRINT=$(fingerprint_of "$FIXTURES/ctrlchars.der")
+NAMESENC_UTF8_FINGERPRINT=$(fingerprint_of "$FIXTURES/namesenc_utf8.der")
+NAMESENC_BMP_FINGERPRINT=$(fingerprint_of "$FIXTURES/namesenc_bmp.der")
+NAMESENC_UNIVERSAL_FINGERPRINT=$(fingerprint_of "$FIXTURES/namesenc_universal.der")
+NAMEENC_CROSS_FINGERPRINT=$(fingerprint_of "$FIXTURES/nameenc_cross.der")
+NAMEENC_NUL_FINGERPRINT=$(fingerprint_of "$FIXTURES/nameenc_nul.der")
+NAMEENC_SUP_FINGERPRINT=$(fingerprint_of "$FIXTURES/nameenc_supplementary.der")
 CENTURY_FINGERPRINT=$(fingerprint_of "$FIXTURES/century.der")
 MIXED_FINGERPRINT=$(fingerprint_of "$FIXTURES/mixedyears.der")
 GENERALIZED_FINGERPRINT=$(fingerprint_of "$FIXTURES/generalized.der")
@@ -137,6 +143,33 @@ LONGOID_ISSUER='C=CN, O=长OID测试根CA, L=北京+ST=北京\\\,市\+区\\\\根
 #     separators intact alongside the control bytes.
 CTRL_SUBJECT='C=CN, O=控制字符测试组织, OU=研发\09部\0A一组, OU=质量\0D组, L=\0A沪上+ST=北京\09, CN=中\00文, CN=真实\0A换行, CN=字面\\0A文字, OU=甲\01\07\0B\1F乙, CN=分\,隔\+符\\与\0B中文'
 CTRL_ISSUER='C=CN, O=颁发\09机构, OU=CA中心\0D, OU=\0A起始, L=北京+ST=\00起点, CN=根\\0D证书, CN=尾\00, title=换\0C页'
+
+# The same name text stored once each as UTF8String, BMPString and
+# UniversalString (tests/fixtures/namesenc_{utf8,bmp,universal}.*). BMPString
+# and UniversalString hold zero bytes merely to encode ordinary characters
+# (e.g. "中" -> 00 4E 2D in BMPString), which must never be shown as \00:
+# after conversion all three render this one text verbatim. Chinese,
+# accented Latin letters and plain ASCII are all present.
+NAMEENC_SAME='C=CN, O=示例科技CaféOne, OU=研发部NaïveGroup, CN=用户Renée01'
+
+# Subject and issuer of nameenc_cross use different encodings (subject values
+# are BMPString, issuer values UTF8String) AND different text, proving the two
+# lines cannot borrow each other's converted values.
+NAMEENC_CROSS_SUBJECT='C=CN, O=主体公司Subject, OU=终端部门EndEntity, CN=最终用户UserBMP'
+NAMEENC_CROSS_ISSUER='C=CN, O=颁发机构Issuer, CN=根CA-Root'
+
+# Real NULs inside name values (nameenc_nul): the subject carries them as
+# BMPString, the issuer as UniversalString. The genuine NUL renders as the
+# visible \00 escape with the following text kept, while the wide encodings'
+# structural zero bytes stay invisible. The shared organization value appears
+# verbatim on both lines; each side has its own NUL-bearing CN.
+NAMEENC_NUL_SUBJECT='C=CN, O=中\00文Aé, CN=主体\00Nul'
+NAMEENC_NUL_ISSUER='C=CN, O=中\00文Aé, CN=颁发\00Root'
+
+# A supplementary-plane character (😀) in a UTF8String subject and a
+# UniversalString issuer: the 4-byte UTF-8 sequence must survive whole from
+# both encodings rather than being split or dropped.
+NAMEENC_SUP_NAME='C=CN, CN=Smile😀笑'
 
 # Subjects of the validity-time fixtures (all self-signed).
 CENTURY_SUBJECT='C=CN, O=Trustpeek Test Org, CN=century-pivot-1950.example.test'
@@ -200,6 +233,21 @@ write_expected_ctrlchars() {  # $1 = encoding, $2 = output file
         printf 'Not Before: 2024-01-01T00:00:00Z\n'
         printf 'Not After: 2044-01-01T00:00:00Z\n'
         printf 'SHA-256 Fingerprint: %s\n' "$CTRLCHARS_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+# Builds the full expected output of one name-encoding fixture:
+# $1 = encoding, $2 = output file, $3 = Subject, $4 = Issuer,
+# $5 = Not Before, $6 = Not After, $7 = SHA-256 fingerprint.
+write_expected_nameenc() {
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$3"
+        printf 'Issuer: %s\n' "$4"
+        printf 'Not Before: %s\n' "$5"
+        printf 'Not After: %s\n' "$6"
+        printf 'SHA-256 Fingerprint: %s\n' "$7"
         printf '%s\n' "$NOTE"
     } >"$2"
 }
@@ -523,7 +571,162 @@ assert_ctrlchars_structure() {
         fail "output must keep the no-trust-verification Note"
 }
 
-# Decodes the base64 body of the single CERTIFICATE PEM block in $1 into $2,
+# Structural guards shared by the name-encoding equivalence cases
+# ($1 = captured stdout file). Beyond the byte-for-byte expected comparison,
+# these prove by name that: UTF8String/BMPString/UniversalString of the same
+# text render verbatim identically (wide-encoding zero bytes never become
+# \00); Subject and Issuer each occupy their own single line and remain valid
+# UTF-8; and the no-trust Note is still printed.
+assert_nameenc_same_structure() {
+    out=$1
+    subject=$(sed -n 's/^Subject: //p' "$out")
+    issuer=$(sed -n 's/^Issuer: //p' "$out")
+
+    [ "$subject" = "$NAMEENC_SAME" ] ||
+        fail "converted name does not match the shared text"
+    [ "$issuer" = "$NAMEENC_SAME" ] ||
+        fail "converted issuer name does not match the shared text"
+
+    # Chinese, accented Latin and plain ASCII all survive.
+    for token in '示例科技CaféOne' '研发部NaïveGroup' '用户Renée01'; do
+        case "$subject$issuer" in
+            *"$token"*) ;;
+            *) fail "name text truncated or mangled: $token" ;;
+        esac
+    done
+
+    # The wide encodings contain zero bytes for ordinary characters, but none
+    # of those may surface as a NUL escape: there is no real NUL in this name.
+    case "$subject$issuer" in
+        *'\00'*) fail "structural zero byte of a wide encoding shown as \\00" ;;
+    esac
+
+    [ "$(grep -c '^Subject: ' "$out")" -eq 1 ] ||
+        fail "Subject must occupy exactly one line"
+    [ "$(grep -c '^Issuer: ' "$out")" -eq 1 ] ||
+        fail "Issuer must occupy exactly one line"
+    [ "$(wc -l <"$out")" -eq 7 ] ||
+        fail "output must have exactly 7 lines (no line split by a name)"
+    iconv -f UTF-8 -t UTF-8 "$out" >/dev/null ||
+        fail "output is not valid UTF-8"
+    grep -qF "$NOTE" "$out" ||
+        fail "output must keep the no-trust-verification Note"
+}
+
+# Structural guards for the field-isolation case (nameenc_cross): a
+# BMPString subject and a UTF8String issuer carry different text, so each
+# converted value must stay on its own line and never appear on the other.
+assert_nameenc_cross_structure() {
+    out=$1
+    subject=$(sed -n 's/^Subject: //p' "$out")
+    issuer=$(sed -n 's/^Issuer: //p' "$out")
+
+    [ "$subject" = "$NAMEENC_CROSS_SUBJECT" ] ||
+        fail "BMPString subject rendered incompletely or reordered"
+    [ "$issuer" = "$NAMEENC_CROSS_ISSUER" ] ||
+        fail "UTF8String issuer rendered incompletely or reordered"
+    [ "$subject" != "$issuer" ] ||
+        fail "subject and issuer must render different names"
+
+    for token in '主体公司Subject' '终端部门EndEntity' '最终用户UserBMP'; do
+        case "$subject" in *"$token"*) ;; *) fail "missing subject value: $token" ;;
+        esac
+        case "$issuer" in
+            *"$token"*) fail "subject value leaked into the issuer line: $token" ;;
+        esac
+    done
+    for token in '颁发机构Issuer' '根CA-Root'; do
+        case "$issuer" in *"$token"*) ;; *) fail "missing issuer value: $token" ;;
+        esac
+        case "$subject" in
+            *"$token"*) fail "issuer value leaked into the subject line: $token" ;;
+        esac
+    done
+
+    [ "$(grep -c '^Subject: ' "$out")" -eq 1 ] ||
+        fail "Subject must occupy exactly one line"
+    [ "$(grep -c '^Issuer: ' "$out")" -eq 1 ] ||
+        fail "Issuer must occupy exactly one line"
+    iconv -f UTF-8 -t UTF-8 "$out" >/dev/null ||
+        fail "output is not valid UTF-8"
+}
+
+# Structural guards for the real-NUL case (nameenc_nul): a genuine NUL in a
+# BMPString or UniversalString value renders as visible \00 with the text
+# after it kept, while the encodings' structural zero bytes never do. The
+# shared organization value is identical on both differently-encoded lines.
+assert_nameenc_nul_structure() {
+    out=$1
+    subject=$(sed -n 's/^Subject: //p' "$out")
+    issuer=$(sed -n 's/^Issuer: //p' "$out")
+
+    [ "$subject" = "$NAMEENC_NUL_SUBJECT" ] ||
+        fail "BMPString NUL subject rendered incompletely or reordered"
+    [ "$issuer" = "$NAMEENC_NUL_ISSUER" ] ||
+        fail "UniversalString NUL issuer rendered incompletely or reordered"
+
+    # The real NUL shows as \00 with text kept on both sides (BMP subject and
+    # Universal issuer agree on the shared organization value).
+    for line in "$subject" "$issuer"; do
+        case "$line" in
+            *'O=中\00文Aé'*) ;;
+            *) fail "real NUL must render as \\00 with following text kept" ;;
+        esac
+        # Ordinary wide-encoding code units contribute no other \00: each
+        # line has exactly two (one in O, one in CN).
+        count=$(printf '%s' "$line" | grep -oF '\00' | wc -l)
+        [ "$count" -eq 2 ] ||
+            fail "expected exactly two real-NUL \\00 escapes per name, got $count"
+    done
+    # Each side keeps its own distinct NUL-bearing CN (no field cross-talk).
+    case "$subject" in *'CN=主体\00Nul'*) ;; *) fail "subject NUL CN lost" ;;
+    esac
+    case "$issuer" in *'CN=颁发\00Root'*) ;; *) fail "issuer NUL CN lost" ;;
+    esac
+    case "$subject" in
+        *'颁发\00Root'*) fail "issuer CN leaked into subject line" ;;
+    esac
+
+    [ "$(grep -c '^Subject: ' "$out")" -eq 1 ] ||
+        fail "Subject must occupy exactly one line"
+    [ "$(grep -c '^Issuer: ' "$out")" -eq 1 ] ||
+        fail "Issuer must occupy exactly one line"
+    [ "$(wc -l <"$out")" -eq 7 ] ||
+        fail "output must have exactly 7 lines (no line split by a NUL)"
+    # No raw NUL byte may reach stdout; the only sub-0x20 bytes are newlines.
+    nul_count=$(LC_ALL=C tr -cd '\000' <"$out" | wc -c)
+    [ "$nul_count" -eq 0 ] || fail "a raw NUL byte leaked into the output"
+    iconv -f UTF-8 -t UTF-8 "$out" >/dev/null ||
+        fail "output is not valid UTF-8"
+}
+
+# Structural guards for the supplementary-plane case (nameenc_supplementary):
+# the same astral character is whole in a UTF8String and a UniversalString.
+assert_nameenc_sup_structure() {
+    out=$1
+    subject=$(sed -n 's/^Subject: //p' "$out")
+    issuer=$(sed -n 's/^Issuer: //p' "$out")
+
+    [ "$subject" = "$NAMEENC_SUP_NAME" ] ||
+        fail "UTF8String supplementary-character subject rendered incompletely"
+    [ "$issuer" = "$NAMEENC_SUP_NAME" ] ||
+        fail "UniversalString supplementary-character issuer rendered incompletely"
+    # The 4-byte UTF-8 encoding of U+1F600 appears whole on both lines, kept
+    # together with its surrounding BMP text.
+    count=$(grep -oF '😀' "$out" | wc -l)
+    [ "$count" -eq 2 ] ||
+        fail "supplementary-plane character must appear whole on both lines, got $count"
+    case "$subject$issuer" in
+        *'Smile😀笑'*) ;;
+        *) fail "text around the supplementary-plane character must survive" ;;
+    esac
+    [ "$(wc -l <"$out")" -eq 7 ] ||
+        fail "output must have exactly 7 lines"
+    iconv -f UTF-8 -t UTF-8 "$out" >/dev/null ||
+        fail "output is not valid UTF-8"
+}
+
+
 # asserting the PEM-integrity preconditions shared by the body-content cases:
 # exactly one begin/end marker pair, only whitespace outside the block, and a
 # body whose base64 decodes completely. When this passes, any rejection of the
@@ -896,6 +1099,221 @@ case "$CASE" in
         pem_issuer=$(sed -n 's/^Issuer: //p' "$TMP/pem.out")
         [ "$pem_subject" != "$pem_issuer" ] ||
             fail "ctrlchars fixture must have different subject and issuer"
+        ;;
+
+    # --- UTF8String/BMPString/UniversalString name encodings ---------
+
+    der_names_enc_utf8)
+        # Reference encoding: the shared name text as UTF8String.
+        write_expected_nameenc DER "$TMP/expected" "$NAMEENC_SAME" "$NAMEENC_SAME" \
+            '2024-03-01T00:00:00Z' '2044-03-01T00:00:00Z' "$NAMESENC_UTF8_FINGERPRINT"
+        expect_success "$FIXTURES/namesenc_utf8.der" "$TMP/expected"
+        assert_nameenc_same_structure "$TMP/expected"
+        ;;
+
+    pem_names_enc_utf8)
+        write_expected_nameenc PEM "$TMP/expected" "$NAMEENC_SAME" "$NAMEENC_SAME" \
+            '2024-03-01T00:00:00Z' '2044-03-01T00:00:00Z' "$NAMESENC_UTF8_FINGERPRINT"
+        expect_success "$FIXTURES/namesenc_utf8.pem" "$TMP/expected"
+        assert_nameenc_same_structure "$TMP/expected"
+        ;;
+
+    der_names_enc_bmp)
+        # The same text as BMPString must convert to the identical UTF-8;
+        # its 16-bit code units' zero bytes must not truncate the value.
+        write_expected_nameenc DER "$TMP/expected" "$NAMEENC_SAME" "$NAMEENC_SAME" \
+            '2024-03-01T00:00:00Z' '2044-03-01T00:00:00Z' "$NAMESENC_BMP_FINGERPRINT"
+        expect_success "$FIXTURES/namesenc_bmp.der" "$TMP/expected"
+        assert_nameenc_same_structure "$TMP/expected"
+        ;;
+
+    pem_names_enc_bmp)
+        write_expected_nameenc PEM "$TMP/expected" "$NAMEENC_SAME" "$NAMEENC_SAME" \
+            '2024-03-01T00:00:00Z' '2044-03-01T00:00:00Z' "$NAMESENC_BMP_FINGERPRINT"
+        expect_success "$FIXTURES/namesenc_bmp.pem" "$TMP/expected"
+        assert_nameenc_same_structure "$TMP/expected"
+        ;;
+
+    der_names_enc_universal)
+        # The same text as UniversalString converts to the identical UTF-8;
+        # its 32-bit code units' zero bytes must not truncate the value.
+        write_expected_nameenc DER "$TMP/expected" "$NAMEENC_SAME" "$NAMEENC_SAME" \
+            '2024-03-01T00:00:00Z' '2044-03-01T00:00:00Z' "$NAMESENC_UNIVERSAL_FINGERPRINT"
+        expect_success "$FIXTURES/namesenc_universal.der" "$TMP/expected"
+        assert_nameenc_same_structure "$TMP/expected"
+        ;;
+
+    pem_names_enc_universal)
+        write_expected_nameenc PEM "$TMP/expected" "$NAMEENC_SAME" "$NAMEENC_SAME" \
+            '2024-03-01T00:00:00Z' '2044-03-01T00:00:00Z' "$NAMESENC_UNIVERSAL_FINGERPRINT"
+        expect_success "$FIXTURES/namesenc_universal.pem" "$TMP/expected"
+        assert_nameenc_same_structure "$TMP/expected"
+        ;;
+
+    names_enc_three_agree)
+        # The three encodings express the same name text: in BOTH Subject and
+        # Issuer the converted attribute values must agree verbatim across
+        # UTF8String, BMPString and UniversalString (checked in PEM and DER).
+        for stem in namesenc_utf8 namesenc_bmp namesenc_universal; do
+            for ext in pem der; do
+                "$BIN" inspect "$FIXTURES/$stem.$ext" >"$TMP/$stem.$ext.out" 2>"$TMP/$stem.$ext.err"
+                rc=$?
+                [ "$rc" -eq 0 ] || fail "$stem.$ext inspect failed with $rc"
+                [ -s "$TMP/$stem.$ext.err" ] &&
+                    fail "$stem.$ext stderr not empty: $(cat "$TMP/$stem.$ext.err")"
+                sed -n 's/^Subject: //p' "$TMP/$stem.$ext.out" >"$TMP/$stem.$ext.subject"
+                sed -n 's/^Issuer: //p' "$TMP/$stem.$ext.out" >"$TMP/$stem.$ext.issuer"
+            done
+        done
+        for field in subject issuer; do
+            for ext in pem der; do
+                cmp -s "$TMP/namesenc_utf8.$ext.$field" "$TMP/namesenc_bmp.$ext.$field" ||
+                    fail "UTF8String and BMPString $field text differs ($ext)"
+                cmp -s "$TMP/namesenc_utf8.$ext.$field" "$TMP/namesenc_universal.$ext.$field" ||
+                    fail "UTF8String and UniversalString $field text differs ($ext)"
+            done
+        done
+        ;;
+
+    der_nameenc_cross)
+        # BMPString subject vs UTF8String issuer, different text: each value
+        # stays on its own line.
+        write_expected_nameenc DER "$TMP/expected" \
+            "$NAMEENC_CROSS_SUBJECT" "$NAMEENC_CROSS_ISSUER" \
+            '2024-04-01T00:00:00Z' '2044-04-01T00:00:00Z' "$NAMEENC_CROSS_FINGERPRINT"
+        expect_success "$FIXTURES/nameenc_cross.der" "$TMP/expected"
+        assert_nameenc_cross_structure "$TMP/expected"
+        ;;
+
+    pem_nameenc_cross)
+        write_expected_nameenc PEM "$TMP/expected" \
+            "$NAMEENC_CROSS_SUBJECT" "$NAMEENC_CROSS_ISSUER" \
+            '2024-04-01T00:00:00Z' '2044-04-01T00:00:00Z' "$NAMEENC_CROSS_FINGERPRINT"
+        expect_success "$FIXTURES/nameenc_cross.pem" "$TMP/expected"
+        assert_nameenc_cross_structure "$TMP/expected"
+        ;;
+
+    pem_der_nameenc_cross_same)
+        # PEM and DER of the cross-encoding certificate agree in every field
+        # except Encoding.
+        "$BIN" inspect "$FIXTURES/nameenc_cross.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/nameenc_cross.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' || fail "PEM not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' || fail "DER not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree outside the Encoding line"
+        assert_nameenc_cross_structure "$TMP/der.out"
+        ;;
+
+    der_nameenc_nul)
+        # A real NUL in BMPString values renders as visible \00 with the text
+        # after it kept; the encoding's structural zero bytes do not.
+        write_expected_nameenc DER "$TMP/expected" \
+            "$NAMEENC_NUL_SUBJECT" "$NAMEENC_NUL_ISSUER" \
+            '2024-05-01T00:00:00Z' '2044-05-01T00:00:00Z' "$NAMEENC_NUL_FINGERPRINT"
+        expect_success "$FIXTURES/nameenc_nul.der" "$TMP/expected"
+        assert_nameenc_nul_structure "$TMP/expected"
+        ;;
+
+    pem_nameenc_nul)
+        # The issuer NULs live in UniversalString values here.
+        write_expected_nameenc PEM "$TMP/expected" \
+            "$NAMEENC_NUL_SUBJECT" "$NAMEENC_NUL_ISSUER" \
+            '2024-05-01T00:00:00Z' '2044-05-01T00:00:00Z' "$NAMEENC_NUL_FINGERPRINT"
+        expect_success "$FIXTURES/nameenc_nul.pem" "$TMP/expected"
+        assert_nameenc_nul_structure "$TMP/expected"
+        ;;
+
+    pem_der_nameenc_nul_same)
+        "$BIN" inspect "$FIXTURES/nameenc_nul.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/nameenc_nul.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' || fail "PEM not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' || fail "DER not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree outside the Encoding line"
+        assert_nameenc_nul_structure "$TMP/der.out"
+        ;;
+
+    der_nameenc_supplementary)
+        # A supplementary-plane character in UTF8String (subject) and
+        # UniversalString (issuer) is shown whole from both encodings.
+        write_expected_nameenc DER "$TMP/expected" \
+            "$NAMEENC_SUP_NAME" "$NAMEENC_SUP_NAME" \
+            '2024-06-01T00:00:00Z' '2044-06-01T00:00:00Z' "$NAMEENC_SUP_FINGERPRINT"
+        expect_success "$FIXTURES/nameenc_supplementary.der" "$TMP/expected"
+        assert_nameenc_sup_structure "$TMP/expected"
+        ;;
+
+    pem_nameenc_supplementary)
+        write_expected_nameenc PEM "$TMP/expected" \
+            "$NAMEENC_SUP_NAME" "$NAMEENC_SUP_NAME" \
+            '2024-06-01T00:00:00Z' '2044-06-01T00:00:00Z' "$NAMEENC_SUP_FINGERPRINT"
+        expect_success "$FIXTURES/nameenc_supplementary.pem" "$TMP/expected"
+        assert_nameenc_sup_structure "$TMP/expected"
+        ;;
+
+    pem_der_nameenc_supplementary_same)
+        "$BIN" inspect "$FIXTURES/nameenc_supplementary.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/nameenc_supplementary.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' || fail "PEM not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' || fail "DER not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree outside the Encoding line"
+        assert_nameenc_sup_structure "$TMP/der.out"
+        ;;
+
+    namebad_bmp_der)
+        # A BMPString value with an odd content length is malformed name
+        # content inside a complete certificate: exit 1, invalid-certificate
+        # diagnostic naming the path, empty stdout (never a read failure).
+        expect_invalid "$FIXTURES/namebad_bmp.der"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "a malformed BMPString is bad certificate content, not a read failure"
+        ;;
+
+    namebad_bmp_pem)
+        # Same content served as PEM must be classified identically.
+        expect_invalid "$FIXTURES/namebad_bmp.pem"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "a malformed BMPString is bad certificate content, not a read failure"
+        ;;
+
+    namebad_universal_der)
+        # A UniversalString value whose length is not a multiple of four is
+        # malformed name content inside a complete certificate.
+        expect_invalid "$FIXTURES/namebad_universal.der"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "a malformed UniversalString is bad certificate content, not a read failure"
+        ;;
+
+    namebad_universal_pem)
+        expect_invalid "$FIXTURES/namebad_universal.pem"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "a malformed UniversalString is bad certificate content, not a read failure"
         ;;
 
     # --- Validity-time rendering -------------------------------------

@@ -60,6 +60,14 @@ marker
 names
 longoid
 ctrlchars
+namesenc_utf8
+namesenc_bmp
+namesenc_universal
+nameenc_cross
+nameenc_nul
+nameenc_supplementary
+namebad_bmp
+namebad_universal
 century
 mixedyears
 generalized
@@ -113,7 +121,11 @@ done
 #     (e.g. a trailing fifth character of a quantum) can hide excess bytes.
 # The impossible-date certificate is included here on purpose: its PEM body
 # decodes to complete DER bytes; its invalidity is certificate CONTENT that
-# only `trustpeek inspect` must reject, not a preparation error.
+# only `trustpeek inspect` must reject, not a preparation error. The two
+# malformed-name certificates (an odd-length BMPString and a
+# UniversalString whose length is not a multiple of four) are the same: the
+# bytes are complete, canonical DER that decode cleanly here, and only
+# inspect's certificate parsing must reject them as invalid content.
 prepare_cert_der() {
     stem=$1
     pem="$SRC/$stem.pem"
