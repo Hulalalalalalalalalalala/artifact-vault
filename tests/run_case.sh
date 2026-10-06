@@ -39,10 +39,44 @@ TIMEOUT=$(command -v timeout || true)
 
 NOTE='Note: this output displays certificate information only; reading the file successfully does not verify the signature or establish trust.'
 
-# The fingerprints are derived from the committed DER fixtures, so the
-# expected values stay in sync with the certificates on disk.
+# The fingerprints are derived from the prepared DER fixtures: each DER is
+# produced by base64-decoding the body of the matching committed PEM, so the
+# expected values stay in sync with the original certificates on disk and
+# never silently become an empty string when a DER fixture is missing.
 fingerprint_of() {
-    sha256sum "$1" | cut -d' ' -f1 |
+    der=$1
+    # Fail loudly instead of deriving an empty expected fingerprint: the
+    # prepare_fixtures step must have produced this file from the committed
+    # PEM, so its absence means test data preparation is broken, not that
+    # the certificate has no fingerprint.
+    if [ ! -e "$der" ]; then
+        echo "FAIL: $CASE: missing DER fixture '$der' (the prepare_fixtures step should have created it from the committed PEM)" >&2
+        exit 1
+    fi
+    if [ ! -f "$der" ]; then
+        echo "FAIL: $CASE: DER fixture '$der' is not a regular file" >&2
+        exit 1
+    fi
+    if [ ! -r "$der" ]; then
+        echo "FAIL: $CASE: DER fixture '$der' is not readable" >&2
+        exit 1
+    fi
+    if [ ! -s "$der" ]; then
+        echo "FAIL: $CASE: DER fixture '$der' is empty; refusing to use an empty expected fingerprint" >&2
+        exit 1
+    fi
+    hash=$(sha256sum "$der" 2>/dev/null | cut -d' ' -f1)
+    if [ "${#hash}" -ne 64 ]; then
+        echo "FAIL: $CASE: cannot compute the 64-hex-char SHA-256 fingerprint of DER fixture '$der' (got '${hash}')" >&2
+        exit 1
+    fi
+    case "$hash" in
+        *[!0-9a-fA-F]*)
+            echo "FAIL: $CASE: SHA-256 fingerprint of '$der' is not hexadecimal: '$hash'" >&2
+            exit 1
+            ;;
+    esac
+    printf '%s' "$hash" |
         tr 'a-f' 'A-F' | sed 's/\(..\)/\1:/g; s/:$//'
 }
 FINGERPRINT=$(fingerprint_of "$FIXTURES/valid.der")

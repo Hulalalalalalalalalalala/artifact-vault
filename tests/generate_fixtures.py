@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Regenerate the committed test fixtures under tests/fixtures/.
 
-The fixtures are checked into the repository so the regression tests never
-need network access, a system trust store, or even this script. Re-run only
-when a fixture must change; the certificates use fixed serial numbers and
-fixed validity windows so regeneration is deterministic except for the key
-material (new keys change the fingerprints, so update tests accordingly is
-NOT needed -- fingerprints are derived from the committed DER at test time).
+Only the PEM samples (*.pem) are checked into the repository. The matching
+DER files are NOT committed: they are derived offline at build/test time by
+tests/prepare_fixtures.sh, which base64-decodes each certificate PEM body
+byte-for-byte (same certificate, same key, names, validity and signature).
+The regression tests therefore need no network access, no system trust
+store and neither this script nor the third-party `cryptography` package.
+
+Re-run this script only when a fixture must change (an optional maintenance
+operation requiring `cryptography`). It rewrites the PEM samples with fixed
+serial numbers and fixed validity windows; regeneration is deterministic
+except for the key material. New keys change the fingerprints, but nothing
+has to be updated by hand: the build regenerates the DER copies and the test
+script derives the expected fingerprints from those DER bytes at run time.
+After regenerating, reconfigure/rebuild so prepare_fixtures.sh re-derives
+the DER copies in the build tree.
 """
 
 import base64
@@ -133,8 +142,12 @@ def pem_from_der(der):
     ).encode("ascii")
 
 
-def write_cert_pair(stem, der):
-    (FIXTURES / f"{stem}.der").write_bytes(der)
+def write_cert_pem(stem, der):
+    """Write only the committed PEM sample for one certificate.
+
+    The matching DER is derived at build time by prepare_fixtures.sh
+    (base64-decoding exactly this PEM body), so it must not be written here.
+    """
     (FIXTURES / f"{stem}.pem").write_bytes(pem_from_der(der))
 
 
@@ -274,13 +287,19 @@ def write_ctrlchars_fixtures():
         .not_valid_after(datetime.datetime(2044, 1, 1, tzinfo=utc))
         .sign(ctrl_issuer_key, hashes.SHA256())
     )
-    write_cert_pair("ctrlchars", ctrl_cert.public_bytes(serialization.Encoding.DER))
+    write_cert_pem("ctrlchars", ctrl_cert.public_bytes(serialization.Encoding.DER))
 
 
 def main():
     import datetime
 
     FIXTURES.mkdir(exist_ok=True)
+    # DER files are derived artifacts, never source samples: drop any stale
+    # *.der left in the source fixture tree so regeneration leaves exactly
+    # the committed PEM set (the next build re-derives DER in its own tree).
+    for stale_der in FIXTURES.glob("*.der"):
+        stale_der.unlink()
+
     utc = datetime.timezone.utc
 
     valid_name = x509.Name(
@@ -298,7 +317,6 @@ def main():
         serial=0x1001,
     )
     der = valid.public_bytes(serialization.Encoding.DER)
-    (FIXTURES / "valid.der").write_bytes(der)
     (FIXTURES / "valid.pem").write_bytes(
         valid.public_bytes(serialization.Encoding.PEM)
     )
@@ -335,9 +353,6 @@ def main():
     (FIXTURES / "expired.pem").write_bytes(
         expired.public_bytes(serialization.Encoding.PEM)
     )
-    (FIXTURES / "expired.der").write_bytes(
-        expired.public_bytes(serialization.Encoding.DER)
-    )
 
     # A certificate whose subject name carries the PEM begin/end markers as
     # ordinary attribute text. The encoding detection must look at the file
@@ -358,9 +373,6 @@ def main():
         datetime.datetime(2021, 1, 1, tzinfo=utc),
         datetime.datetime(2041, 1, 1, tzinfo=utc),
         serial=0x1003,
-    )
-    (FIXTURES / "marker.der").write_bytes(
-        marker.public_bytes(serialization.Encoding.DER)
     )
     (FIXTURES / "marker.pem").write_bytes(
         marker.public_bytes(serialization.Encoding.PEM)
@@ -428,9 +440,6 @@ def main():
         .not_valid_before(datetime.datetime(2022, 6, 1, tzinfo=utc))
         .not_valid_after(datetime.datetime(2042, 6, 1, tzinfo=utc))
         .sign(complex_issuer_key, hashes.SHA256())
-    )
-    (FIXTURES / "names.der").write_bytes(
-        complex_cert.public_bytes(serialization.Encoding.DER)
     )
     (FIXTURES / "names.pem").write_bytes(
         complex_cert.public_bytes(serialization.Encoding.PEM)
@@ -502,9 +511,6 @@ def main():
         .not_valid_after(datetime.datetime(2043, 6, 1, tzinfo=utc))
         .sign(long_oid_issuer_key, hashes.SHA256())
     )
-    (FIXTURES / "longoid.der").write_bytes(
-        long_oid_cert.public_bytes(serialization.Encoding.DER)
-    )
     (FIXTURES / "longoid.pem").write_bytes(
         long_oid_cert.public_bytes(serialization.Encoding.PEM)
     )
@@ -542,7 +548,7 @@ def main():
         datetime.datetime(1952, 2, 29, 23, 59, 59, tzinfo=utc),
         serial=0x4001,
     )
-    write_cert_pair("century", century.public_bytes(serialization.Encoding.DER))
+    write_cert_pem("century", century.public_bytes(serialization.Encoding.DER))
 
     # The two fields use different tags on the same certificate: notBefore is
     # UTCTime "49" (-> 2049), notAfter is GeneralizedTime 2050. The moments
@@ -557,7 +563,7 @@ def main():
         datetime.datetime(2050, 1, 1, 0, 30, 59, tzinfo=utc),
         serial=0x4002,
     )
-    write_cert_pair("mixedyears", mixed.public_bytes(serialization.Encoding.DER))
+    write_cert_pem("mixedyears", mixed.public_bytes(serialization.Encoding.DER))
 
     # Both fields are GeneralizedTime with full 4-digit years at/after 2050:
     # the notBefore is the valid leap day 2052-02-29 (with every time unit
@@ -571,7 +577,7 @@ def main():
         datetime.datetime(2100, 12, 31, 23, 59, 59, tzinfo=utc),
         serial=0x4003,
     )
-    write_cert_pair(
+    write_cert_pem(
         "generalized", generalized.public_bytes(serialization.Encoding.DER)
     )
 
@@ -593,7 +599,7 @@ def main():
         generalized_time_tlv("19490101000000Z"),
         utc_time_tlv("500615120000Z"),
     )
-    write_cert_pair("reverseorder", reverse_der)
+    write_cert_pem("reverseorder", reverse_der)
 
     # Structurally complete certificate whose notAfter claims February 30:
     # the GeneralizedTime text is well formed but no such date exists. d2i
@@ -612,7 +618,7 @@ def main():
         utc_time_tlv("490228000000Z"),
         generalized_time_tlv("20500230000000Z"),
     )
-    write_cert_pair("baddate", baddate_der)
+    write_cert_pem("baddate", baddate_der)
 
 
 if __name__ == "__main__":
