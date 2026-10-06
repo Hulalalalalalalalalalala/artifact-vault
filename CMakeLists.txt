@@ -77,6 +77,13 @@ if(BUILD_TESTING)
         der_control_chars
         pem_control_chars
         pem_der_control_chars_same
+        der_name_encodings
+        pem_name_encodings
+        pem_der_name_encodings_same
+        name_bmpstring_odd_der
+        name_bmpstring_odd_pem
+        name_universalstring_bad_der
+        name_universalstring_bad_pem
         time_century_utc_der
         time_century_utc_pem
         time_pivot_49_and_50

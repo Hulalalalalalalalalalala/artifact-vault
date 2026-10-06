@@ -89,6 +89,7 @@ CENTURY_FINGERPRINT=$(fingerprint_of "$FIXTURES/century.der")
 MIXED_FINGERPRINT=$(fingerprint_of "$FIXTURES/mixedyears.der")
 GENERALIZED_FINGERPRINT=$(fingerprint_of "$FIXTURES/generalized.der")
 REVERSE_FINGERPRINT=$(fingerprint_of "$FIXTURES/reverseorder.der")
+ENCODINGS_FINGERPRINT=$(fingerprint_of "$FIXTURES/encodings.der")
 
 VALID_SUBJECT='C=CN, O=Trustpeek Test Org, OU=Engineering, CN=valid.example.test'
 EXPIRED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=expired.example.test'
@@ -143,6 +144,27 @@ CENTURY_SUBJECT='C=CN, O=Trustpeek Test Org, CN=century-pivot-1950.example.test'
 MIXED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=mixed-year-tags-49-2050.example.test'
 GENERALIZED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=generalized-2050.example.test'
 REVERSE_SUBJECT='C=CN, O=Trustpeek Test Org, CN=reverse-tag-order.example.test'
+
+# Subject and issuer of the string-encoding certificate
+# (tests/fixtures/encodings.{pem,der}). Its name values are stored as
+# UTF8String, BMPString (UTF-16BE) and UniversalString (UTF-32BE); inspect
+# converts all three to UTF-8, so the byte-for-byte comparison pins:
+#   - the SAME text "技术部 Déjà Vu 测试" (Chinese, accented Latin, plain
+#     ASCII) stored once per encoding -- three subject OU attributes plus
+#     one issuer OU attribute must render character-for-character identical;
+#   - the zero bytes BMPString/UniversalString use to pad ordinary
+#     characters (e.g. "Shanghai" as BMPString is 00 53 00 68 ...) must
+#     neither truncate the value nor surface as the \00 escape;
+#   - the supplementary-plane character U+20000 ("𠀀") in a UTF8String
+#     subject CN and a UniversalString issuer CN renders in full both times;
+#   - a REAL U+0000 character inside a BMPString subject CN and a UTF8String
+#     issuer CN renders as the visible \00 escape with the text after it
+#     preserved;
+#   - subject values in BMPString alongside issuer values in UniversalString
+#     stay in their own fields (subject O starts "BMP编码", issuer O starts
+#     "通用编码"; neither text may appear in the other line).
+ENC_SUBJECT='C=CN, O=BMP编码 Köln 中文, OU=技术部 Déjà Vu 测试, OU=技术部 Déjà Vu 测试, OU=技术部 Déjà Vu 测试, L=Shanghai, CN=终端𠀀证书, CN=零\00字符'
+ENC_ISSUER='C=CN, O=通用编码 Köln 中文, OU=技术部 Déjà Vu 测试, CN=终端𠀀证书, CN=颁发\00者CA'
 
 write_expected_valid() {  # $1 = encoding, $2 = output file
     {
@@ -202,6 +224,127 @@ write_expected_ctrlchars() {  # $1 = encoding, $2 = output file
         printf 'SHA-256 Fingerprint: %s\n' "$CTRLCHARS_FINGERPRINT"
         printf '%s\n' "$NOTE"
     } >"$2"
+}
+
+# Builds the full expected output of the string-encoding fixture:
+# $1 = encoding, $2 = output file.
+write_expected_encodings() {
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$ENC_SUBJECT"
+        printf 'Issuer: %s\n' "$ENC_ISSUER"
+        printf 'Not Before: 2025-01-01T00:00:00Z\n'
+        printf 'Not After: 2045-01-01T00:00:00Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$ENCODINGS_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+# Structural guards for the string-encoding name output ($1 = captured
+# stdout file). The byte-for-byte expected comparison already pins
+# everything; these checks re-prove by name the properties the fixture
+# exists for, so a regression (a value truncated at a BMPString zero byte, a
+# padding zero byte shown as \00, a lost supplementary-plane character, text
+# leaking between Subject and Issuer) is explained rather than shown as a
+# raw diff.
+assert_encodings_structure() {
+    out=$1
+    subject=$(sed -n 's/^Subject: //p' "$out")
+    issuer=$(sed -n 's/^Issuer: //p' "$out")
+
+    # Subject and issuer are different names, each on exactly one line.
+    [ "$subject" != "$issuer" ] ||
+        fail "subject and issuer must render different names"
+    [ "$(grep -c '^Subject: ' "$out")" -eq 1 ] ||
+        fail "Subject must occupy exactly one line"
+    [ "$(grep -c '^Issuer: ' "$out")" -eq 1 ] ||
+        fail "Issuer must occupy exactly one line"
+    [ "$(wc -l <"$out")" -eq 7 ] ||
+        fail "output must have exactly 7 lines (no line split by a name)"
+    [ "$subject" = "$ENC_SUBJECT" ] ||
+        fail "string-encoding subject rendered incompletely or reordered"
+    [ "$issuer" = "$ENC_ISSUER" ] ||
+        fail "string-encoding issuer rendered incompletely or reordered"
+
+    # Whole output, including the converted BMPString/UniversalString
+    # values, must remain valid UTF-8.
+    iconv -f UTF-8 -t UTF-8 "$out" >/dev/null ||
+        fail "output is not valid UTF-8"
+
+    # No raw zero or control byte may leak into the output: the only bytes
+    # below 0x20 (plus DEL) in the whole stream are the 7 line-ending
+    # newlines. A raw NUL would mean a BMPString/UniversalString padding
+    # byte reached the display unconverted.
+    ctrl_bytes=$(LC_ALL=C tr -cd '\000-\037\177' <"$out" | wc -c)
+    [ "$ctrl_bytes" -eq 7 ] ||
+        fail "output carries $ctrl_bytes raw control bytes, expected only the 7 newlines"
+
+    # The same text stored as UTF8String, BMPString and UniversalString
+    # renders identically: three subject OU values plus one issuer OU value,
+    # four verbatim copies in all.
+    ou_count=$(printf '%s\n%s\n' "$subject" "$issuer" |
+                   grep -oF 'OU=技术部 Déjà Vu 测试' | wc -l)
+    [ "$ou_count" -eq 4 ] ||
+        fail "the same text in three encodings must render identically 4 times, got $ou_count"
+    [ "$(printf '%s' "$subject" | grep -oF 'OU=技术部 Déjà Vu 测试' | wc -l)" -eq 3 ] ||
+        fail "subject must show the shared text on all three OU attributes"
+
+    # BMPString zero bytes that merely pad ordinary characters must not
+    # become the \00 escape or truncate the value: pure-ASCII "Shanghai"
+    # stored as BMPString renders as plain text.
+    case "$subject" in
+        *'L=Shanghai'*) ;;
+        *) fail "ASCII text in BMPString must render without escapes" ;;
+    esac
+    case "$subject" in
+        *'\00S'*|*'S\00h'*) fail "BMPString padding zero bytes shown as \\00" ;;
+    esac
+    # Exactly two \00 escapes exist in the whole output: the two REAL U+0000
+    # characters. Any more would be encoding padding misread as content.
+    nul_count=$(grep -oF '\00' "$out" | wc -l)
+    [ "$nul_count" -eq 2 ] ||
+        fail "expected exactly 2 visible \\00 escapes (the real NUL characters), got $nul_count"
+
+    # A real NUL in the middle of a value keeps the text on both sides.
+    case "$subject" in
+        *'CN=零\00字符'*) ;;
+        *) fail "text around a real NUL in a BMPString value must survive" ;;
+    esac
+    case "$issuer" in
+        *'CN=颁发\00者CA'*) ;;
+        *) fail "text around a real NUL in a UTF8String value must survive" ;;
+    esac
+
+    # The supplementary-plane character U+20000 renders in full from both
+    # UTF8String (subject) and UniversalString (issuer).
+    case "$subject" in
+        *'CN=终端𠀀证书'*) ;;
+        *) fail "supplementary-plane character lost in UTF8String conversion" ;;
+    esac
+    case "$issuer" in
+        *'CN=终端𠀀证书'*) ;;
+        *) fail "supplementary-plane character lost in UniversalString conversion" ;;
+    esac
+
+    # Different encodings for subject and issuer must not bleed across the
+    # two fields: each line keeps its own text.
+    case "$subject" in
+        *'O=BMP编码 Köln 中文'*) ;;
+        *) fail "subject lost its BMPString organization" ;;
+    esac
+    case "$issuer" in
+        *'O=通用编码 Köln 中文'*) ;;
+        *) fail "issuer lost its UniversalString organization" ;;
+    esac
+    case "$subject" in
+        *'通用编码'*) fail "issuer text leaked into the Subject line" ;;
+    esac
+    case "$issuer" in
+        *'BMP编码'*) fail "subject text leaked into the Issuer line" ;;
+    esac
+
+    grep -qF "$NOTE" "$out" ||
+        fail "output must keep the no-trust-verification Note"
 }
 
 # Builds the full expected output of one self-signed validity-time fixture:
@@ -896,6 +1039,99 @@ case "$CASE" in
         pem_issuer=$(sed -n 's/^Issuer: //p' "$TMP/pem.out")
         [ "$pem_subject" != "$pem_issuer" ] ||
             fail "ctrlchars fixture must have different subject and issuer"
+        ;;
+
+    # --- Name string encodings (UTF8String / BMPString / UniversalString) --
+
+    der_name_encodings)
+        # DER form of the certificate whose name values are stored as
+        # UTF8String, BMPString and UniversalString: all three convert to
+        # UTF-8 for display; exit 0, empty stderr.
+        write_expected_encodings DER "$TMP/expected"
+        expect_success "$FIXTURES/encodings.der" "$TMP/expected"
+        assert_encodings_structure "$TMP/expected"
+        ;;
+
+    pem_name_encodings)
+        # The same certificate as PEM: reported as PEM while the Subject and
+        # Issuer lines stay byte-for-byte identical to the DER rendering.
+        write_expected_encodings PEM "$TMP/expected"
+        expect_success "$FIXTURES/encodings.pem" "$TMP/expected"
+        assert_encodings_structure "$TMP/expected"
+        ;;
+
+    pem_der_name_encodings_same)
+        # PEM vs DER of one certificate: Encoding reports the real format,
+        # everything else (both converted names, the validity and the
+        # SHA-256 fingerprint of the original certificate) must agree.
+        "$BIN" inspect "$FIXTURES/encodings.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/encodings.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree on the string-encoding name fields"
+        assert_encodings_structure "$TMP/der.out"
+        # Guard against weakening the fixture into another self-signed cert.
+        pem_subject=$(sed -n 's/^Subject: //p' "$TMP/pem.out")
+        pem_issuer=$(sed -n 's/^Issuer: //p' "$TMP/pem.out")
+        [ "$pem_subject" != "$pem_issuer" ] ||
+            fail "encodings fixture must have different subject and issuer"
+        ;;
+
+    name_bmpstring_odd_der)
+        # A BMPString holds UTF-16 code units, so its content length must be
+        # even. This certificate is complete and readable, but its subject
+        # organization is a BMPString with an ODD content length: invalid
+        # certificate content (exit 1, stderr names it and the path, stdout
+        # completely empty), never a read failure.
+        expect_invalid "$FIXTURES/bmpodd.der"
+        # expect_invalid leaves the last run's streams in $TMP/stdout|stderr.
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "an odd-length BMPString is bad certificate content, not a read failure"
+        ;;
+
+    name_bmpstring_odd_pem)
+        # Same content served as PEM: the envelope is one complete
+        # certificate block that decodes fully, so the rejection must come
+        # from the malformed name string inside.
+        f=$FIXTURES/bmpodd.pem
+        decode_single_pem_body "$f" "$TMP/body.bin"
+        cmp -s "$TMP/body.bin" "$FIXTURES/bmpodd.der" ||
+            fail "decoded PEM body must be exactly the bmpodd DER bytes"
+        expect_invalid "$f"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "an odd-length BMPString is bad certificate content, not a read failure"
+        ;;
+
+    name_universalstring_bad_der)
+        # A UniversalString holds UTF-32 code units, so its content length
+        # must be a multiple of four. This certificate's issuer organization
+        # is a UniversalString one byte past a multiple of four: invalid
+        # certificate content, never a read failure.
+        expect_invalid "$FIXTURES/univbad.der"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "a misaligned UniversalString is bad certificate content, not a read failure"
+        ;;
+
+    name_universalstring_bad_pem)
+        # Same content served as PEM must be classified identically.
+        f=$FIXTURES/univbad.pem
+        decode_single_pem_body "$f" "$TMP/body.bin"
+        cmp -s "$TMP/body.bin" "$FIXTURES/univbad.der" ||
+            fail "decoded PEM body must be exactly the univbad DER bytes"
+        expect_invalid "$f"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "a misaligned UniversalString is bad certificate content, not a read failure"
         ;;
 
     # --- Validity-time rendering -------------------------------------

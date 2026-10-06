@@ -13,8 +13,9 @@
 # DER bytes are therefore byte-for-byte identical to the PEM body of the
 # one, original certificate -- no key is generated, no certificate is
 # re-signed, and names, validity windows and signatures never change. The
-# deliberately anomalous inputs (the impossible-date certificate still
-# decodes to DER like every other certificate; the PEM-only files carrying
+# deliberately anomalous inputs (the impossible-date certificate and the
+# certificates with malformed BMPString/UniversalString name values still
+# decode to DER like every other certificate; the PEM-only files carrying
 # a trailing NUL byte or a second certificate in one block body, plus the
 # key-only samples) are copied verbatim and never decoded, so the content
 # checks keep rejecting them.
@@ -65,6 +66,9 @@ mixedyears
 generalized
 reverseorder
 baddate
+encodings
+bmpodd
+univbad
 '
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/trustpeek-fixtures.XXXXXX") || {
@@ -111,8 +115,10 @@ done
 #   * canonical encoding: re-encoding the decoded bytes must reproduce the
 #     body text exactly, so no silently ignored extra alphabet characters
 #     (e.g. a trailing fifth character of a quantum) can hide excess bytes.
-# The impossible-date certificate is included here on purpose: its PEM body
-# decodes to complete DER bytes; its invalidity is certificate CONTENT that
+# The impossible-date certificate and the two certificates with malformed
+# name strings (an odd-length BMPString, a UniversalString whose length is
+# not a multiple of four) are included here on purpose: their PEM bodies
+# decode to complete DER bytes; their invalidity is certificate CONTENT that
 # only `trustpeek inspect` must reject, not a preparation error.
 prepare_cert_der() {
     stem=$1

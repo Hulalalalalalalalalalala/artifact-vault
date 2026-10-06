@@ -132,6 +132,98 @@ def replace_validity(der, not_before_tlv, not_after_tlv):
     return der_tlv(0x30, rebuilt)
 
 
+# --- Minimal DER helpers for the name string encodings ---------------------
+#
+# The public builder API always encodes name values as UTF8String. BMPString
+# (UTF-16BE, tag 0x1E) and UniversalString (UTF-32BE, tag 0x1C) are equally
+# legal DirectoryString choices that real certificates use, so the attribute
+# values are re-tagged in DER after signing (the signature becomes
+# cryptographically invalid, which is irrelevant: inspect never verifies
+# signatures). The same helper also emits the two malformed variants the
+# rejection cases pin: a BMPString whose content length is odd and a
+# UniversalString whose content length is not a multiple of four.
+
+
+def name_string_tlv(text, encoding):
+    """Encode one name value with the requested ASN.1 string tag."""
+    if encoding == "utf8":
+        return der_tlv(0x0C, text.encode("utf-8"))
+    if encoding == "bmp":
+        return der_tlv(0x1E, text.encode("utf-16-be"))
+    if encoding == "univ":
+        return der_tlv(0x1C, text.encode("utf-32-be"))
+    if encoding == "bmp-odd":
+        # One trailing zero byte: a BMPString content of odd length cannot
+        # hold a whole number of UTF-16 code units.
+        return der_tlv(0x1E, text.encode("utf-16-be") + b"\x00")
+    if encoding == "univ-bad":
+        # One trailing zero byte: the length is no longer a multiple of the
+        # four bytes every UTF-32 code unit needs.
+        return der_tlv(0x1C, text.encode("utf-32-be") + b"\x00")
+    raise ValueError(f"unknown name string encoding: {encoding}")
+
+
+def rewrite_name(name_content, plan):
+    """Re-tag the string values of one Name (its SEQUENCE content) per plan.
+
+    plan holds one entry per RDN (each RDN here carries exactly one
+    attribute): None keeps the value's existing string type, otherwise the
+    UTF8String text is re-encoded with name_string_tlv().
+    """
+    rdns = iter_der_elements(name_content)
+    assert len(rdns) == len(plan), (len(rdns), len(plan))
+    out_rdns = []
+    for (tag, set_content), encoding in zip(rdns, plan):
+        assert tag == 0x31
+        attrs = iter_der_elements(set_content)
+        assert len(attrs) == 1
+        attr_tag, attr_content = attrs[0]
+        assert attr_tag == 0x30
+        parts = iter_der_elements(attr_content)
+        assert len(parts) == 2 and parts[0][0] == 0x06
+        oid_tlv = der_tlv(*parts[0])
+        if encoding is None:
+            value_tlv = der_tlv(*parts[1])
+        else:
+            assert parts[1][0] == 0x0C, hex(parts[1][0])
+            value_tlv = name_string_tlv(parts[1][1].decode("utf-8"), encoding)
+        out_rdns.append(der_tlv(0x31, der_tlv(0x30, oid_tlv + value_tlv)))
+    return b"".join(out_rdns)
+
+
+def rewrite_name_encodings(der, issuer_plan, subject_plan):
+    """Re-encode the issuer and subject name values of a signed certificate.
+
+    The issuer is the third and the subject the fifth element of the
+    tbsCertificate SEQUENCE (right after version, serial and the signature
+    algorithm, with validity in between), so just those two elements are
+    rewritten and everything else -- key, validity, serial -- stays as
+    signed.
+    """
+    outer = iter_der_elements(der)
+    assert len(outer) == 1 and outer[0][0] == 0x30
+    cert_children = iter_der_elements(outer[0][1])
+    tbs_children = iter_der_elements(cert_children[0][1])
+    first = 1 if tbs_children[0][0] == 0xA0 else 0
+    issuer_index = first + 2
+    subject_index = first + 4
+    assert tbs_children[issuer_index][0] == 0x30
+    assert tbs_children[subject_index][0] == 0x30
+    tbs_children[issuer_index] = (
+        0x30, rewrite_name(tbs_children[issuer_index][1], issuer_plan)
+    )
+    tbs_children[subject_index] = (
+        0x30, rewrite_name(tbs_children[subject_index][1], subject_plan)
+    )
+    rewritten_tbs = der_tlv(
+        0x30, b"".join(der_tlv(t, c) for t, c in tbs_children)
+    )
+    rebuilt = rewritten_tbs + b"".join(
+        der_tlv(t, c) for t, c in cert_children[1:]
+    )
+    return der_tlv(0x30, rebuilt)
+
+
 def pem_from_der(der):
     encoded = base64.b64encode(der).decode("ascii")
     lines = [encoded[i:i + 64] for i in range(0, len(encoded), 64)]
@@ -288,6 +380,108 @@ def write_ctrlchars_fixtures():
         .sign(ctrl_issuer_key, hashes.SHA256())
     )
     write_cert_pem("ctrlchars", ctrl_cert.public_bytes(serialization.Encoding.DER))
+
+
+def write_encoding_fixtures():
+    """Write encodings.pem plus the malformed bmpodd.pem / univbad.pem.
+
+    The encodings certificate stores its name values in all three string
+    encodings inspect must convert to UTF-8 for display: UTF8String,
+    BMPString (UTF-16BE) and UniversalString (UTF-32BE). The names exercise:
+      - the SAME text "技术部 Déjà Vu 测试" (Chinese, accented Latin and
+        plain ASCII) once per encoding -- as three subject OU attributes and
+        one issuer OU attribute -- so all four rendered values must be
+        character-for-character identical;
+      - BMPString and UniversalString zero bytes that merely pad ordinary
+        characters (e.g. "Shanghai" is 00 53 00 68 ... as BMPString): they
+        must NOT surface as the \\00 escape or truncate the value;
+      - the supplementary-plane character U+20000 ("𠀀") in a UTF8String
+        subject CN and a UniversalString issuer CN: both must render the
+        full character;
+      - a REAL U+0000 character inside a BMPString subject CN and a
+        UTF8String issuer CN: it renders as the visible \\00 escape with the
+        text after it preserved;
+      - subject values in BMPString alongside issuer values in
+        UniversalString: the two fields must not leak into each other.
+    Subject and issuer differ (non-self-signed) so the two lines cannot pass
+    by copying one another.
+    """
+    import datetime
+
+    utc = datetime.timezone.utc
+
+    # One text every encoding can express: Chinese + accented Latin + ASCII.
+    shared_text = "技术部 Déjà Vu 测试"
+    # U+20000 is outside the BMP: UTF8String and UniversalString hold it
+    # directly, BMPString cannot (so it never appears in a BMPString here).
+    supplementary_text = "终端𠀀证书"
+
+    enc_subject = x509.Name(
+        [
+            rdn(NameOID.COUNTRY_NAME, "CN"),
+            rdn(NameOID.ORGANIZATION_NAME, "BMP编码 Köln 中文"),
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, shared_text),
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, shared_text),
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, shared_text),
+            # Pure ASCII in BMPString: every other byte is zero, yet the
+            # value must render as plain "Shanghai".
+            rdn(NameOID.LOCALITY_NAME, "Shanghai"),
+            rdn(NameOID.COMMON_NAME, supplementary_text),
+            # A real NUL character in the middle of a BMPString value.
+            rdn(NameOID.COMMON_NAME, "零\x00字符"),
+        ]
+    )
+    enc_issuer = x509.Name(
+        [
+            rdn(NameOID.COUNTRY_NAME, "CN"),
+            rdn(NameOID.ORGANIZATION_NAME, "通用编码 Köln 中文"),
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, shared_text),
+            rdn(NameOID.COMMON_NAME, supplementary_text),
+            # A real NUL character in the middle of a UTF8String value.
+            rdn(NameOID.COMMON_NAME, "颁发\x00者CA"),
+        ]
+    )
+    enc_issuer_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    enc_subject_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    enc_cert = (
+        x509.CertificateBuilder()
+        .subject_name(enc_subject)
+        .issuer_name(enc_issuer)
+        .public_key(enc_subject_key.public_key())
+        .serial_number(0x6001)
+        .not_valid_before(datetime.datetime(2025, 1, 1, tzinfo=utc))
+        .not_valid_after(datetime.datetime(2045, 1, 1, tzinfo=utc))
+        .sign(enc_issuer_key, hashes.SHA256())
+    )
+    base_der = enc_cert.public_bytes(serialization.Encoding.DER)
+
+    # Per-attribute encoding plans (None keeps the builder's UTF8String).
+    # Subject: O, the 2nd/3rd OU, L and the NUL-carrying CN become
+    # BMPString; the 3rd OU becomes UniversalString. Issuer: O, OU and the
+    # supplementary CN become UniversalString.
+    subject_plan = [None, "bmp", None, "bmp", "univ", "bmp", None, "bmp"]
+    issuer_plan = [None, "univ", "univ", "univ", None]
+    write_cert_pem(
+        "encodings", rewrite_name_encodings(base_der, issuer_plan, subject_plan)
+    )
+
+    # The same certificate with a malformed name string each: the subject O
+    # as a BMPString of odd content length, and the issuer O as a
+    # UniversalString whose content length is not a multiple of four. Both
+    # files are complete, readable certificates whose NAME CONTENT is
+    # broken, so inspect must reject them as invalid certificate content.
+    bmp_odd_plan = [None, "bmp-odd", None, "bmp", "univ", "bmp", None, "bmp"]
+    write_cert_pem(
+        "bmpodd", rewrite_name_encodings(base_der, issuer_plan, bmp_odd_plan)
+    )
+    univ_bad_plan = [None, "univ-bad", "univ", "univ", None]
+    write_cert_pem(
+        "univbad", rewrite_name_encodings(base_der, univ_bad_plan, subject_plan)
+    )
 
 
 def main():
@@ -516,6 +710,8 @@ def main():
     )
 
     write_ctrlchars_fixtures()
+
+    write_encoding_fixtures()
 
     # --- Validity-time fixtures -----------------------------------------
     #
