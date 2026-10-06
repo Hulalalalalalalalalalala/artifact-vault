@@ -382,6 +382,93 @@ def main():
         long_oid_cert.public_bytes(serialization.Encoding.PEM)
     )
 
+    # A certificate whose names carry real C0 control characters (bytes below
+    # 0x20) inside DirectoryString values, next to ordinary text. The reader
+    # keeps every attribute and renders such a byte as a backslash plus two
+    # uppercase hex digits, so the name stays one single-line field:
+    #   * LF / CR / TAB render as \0A / \0D / \09 and must not break the line;
+    #   * a NUL in the middle of a value renders \00 with the text on BOTH
+    #     sides intact (the byte is length-delimited, never NUL-terminated);
+    #   * control bytes at the very start/end of a value render the same way
+    #     and must not be mistaken for surrounding whitespace and trimmed;
+    #   * every other byte below 0x20 follows the same rule (\01, \1F, ...);
+    #   * the three-character literal text backslash+"0A" is a different value
+    #     from a real newline: the backslash itself is escaped, giving \\0A.
+    # Chinese text, the repeated OU attribute, the comma/plus/backslash value
+    # separators, the "+"-joined multi-valued RDN and the dotted unknown OID
+    # all appear in the same names, so escaping a control byte must never
+    # create a new attribute or change attribute order/grouping. Subject and
+    # issuer deliberately differ; the validity window is fixed and valid.
+    ctrl_subject = x509.Name(
+        [
+            rdn(NameOID.COUNTRY_NAME, "CN"),
+            rdn(NameOID.ORGANIZATION_NAME, "信任网络\n科技（北京）有限公司"),
+            x509.RelativeDistinguishedName(
+                [
+                    # NUL in the middle: both "ab" and "cd" must survive;
+                    # TAB in the grouped OU must not touch the "+" grouping.
+                    x509.NameAttribute(NameOID.COMMON_NAME, "ab\x00cd"),
+                    x509.NameAttribute(
+                        NameOID.ORGANIZATIONAL_UNIT_NAME, "平台\t事业群"
+                    ),
+                ]
+            ),
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, "安全组"),
+            # 0x01 at the very end, adjacent to non-ASCII text: same escape,
+            # no trimming.
+            rdn(NameOID.TITLE, "Köln/München 工程部\x01"),
+            # Literal backslash + "0A" (three ordinary characters) next to a
+            # real newline in another attribute: renders as \\0A, never \0A.
+            rdn(CUSTOM_NAME_OID, "字面\\0A文本"),
+            # LF at the start and CR at the end, each next to an ordinary
+            # space: control bytes are not surrounding whitespace.
+            rdn(NameOID.COMMON_NAME, "\n 终端用户证书 \r"),
+        ]
+    )
+    ctrl_issuer = x509.Name(
+        [
+            rdn(NameOID.COUNTRY_NAME, "CN"),
+            rdn(NameOID.ORGANIZATION_NAME, "示例\x1f科技有限公司"),
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, "研发部"),
+            # 0x01 between escaped separators and Chinese text.
+            rdn(NameOID.ORGANIZATIONAL_UNIT_NAME, "a,b+c\\d\x01端"),
+            x509.RelativeDistinguishedName(
+                [
+                    x509.NameAttribute(NameOID.LOCALITY_NAME, "上\r海"),
+                    x509.NameAttribute(
+                        NameOID.STATE_OR_PROVINCE_NAME, "省\n测\t试"
+                    ),
+                ]
+            ),
+            # NUL in the middle with Chinese text on both sides.
+            rdn(CUSTOM_NAME_OID, "未知\x00属性值"),
+            # NUL at both ends plus escaped comma/plus/backslash in between.
+            rdn(NameOID.COMMON_NAME, "\x00颁发,者+根\\CA\x00"),
+        ]
+    )
+    ctrl_issuer_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    ctrl_subject_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048
+    )
+    ctrl_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ctrl_subject)
+        .issuer_name(ctrl_issuer)
+        .public_key(ctrl_subject_key.public_key())
+        .serial_number(0x5001)
+        .not_valid_before(datetime.datetime(2024, 6, 1, tzinfo=utc))
+        .not_valid_after(datetime.datetime(2044, 6, 1, tzinfo=utc))
+        .sign(ctrl_issuer_key, hashes.SHA256())
+    )
+    (FIXTURES / "ctrlnames.der").write_bytes(
+        ctrl_cert.public_bytes(serialization.Encoding.DER)
+    )
+    (FIXTURES / "ctrlnames.pem").write_bytes(
+        ctrl_cert.public_bytes(serialization.Encoding.PEM)
+    )
+
     # --- Validity-time fixtures -----------------------------------------
     #
     # These pin how inspect renders the two X.509 time tags:
