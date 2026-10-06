@@ -50,6 +50,10 @@ EXPIRED_FINGERPRINT=$(fingerprint_of "$FIXTURES/expired.der")
 MARKER_FINGERPRINT=$(fingerprint_of "$FIXTURES/marker.der")
 NAMES_FINGERPRINT=$(fingerprint_of "$FIXTURES/names.der")
 LONGOID_FINGERPRINT=$(fingerprint_of "$FIXTURES/longoid.der")
+CENTURY_FINGERPRINT=$(fingerprint_of "$FIXTURES/century.der")
+MIXED_FINGERPRINT=$(fingerprint_of "$FIXTURES/mixedyears.der")
+GENERALIZED_FINGERPRINT=$(fingerprint_of "$FIXTURES/generalized.der")
+REVERSE_FINGERPRINT=$(fingerprint_of "$FIXTURES/reverseorder.der")
 
 VALID_SUBJECT='C=CN, O=Trustpeek Test Org, OU=Engineering, CN=valid.example.test'
 EXPIRED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=expired.example.test'
@@ -82,6 +86,12 @@ OID_87="$OID_79"00000000
 # RDN group and the DN escaping all keep the same rules as the names fixture.
 LONGOID_SUBJECT='C=CN, OU=研发一部, OU=研发二部, OU=组内OU+CN=主体\\\+分组\\\,测试A, 1.2.3.4.5.6.7=短未知属性值, '"$OID_79"'=79位OID值甲, '"$OID_80"'=80位OID值乙, '"$OID_87"'=87位OID值丙, CN=\ 末端用户\ '
 LONGOID_ISSUER='C=CN, O=长OID测试根CA, L=北京+ST=北京\\\,市\+区\\\\根, '"$OID_79"'=颁发者79位值, '"$OID_80"'=颁发者80位值, '"$OID_87"'=颁发者87位值, 1.2.3.4.5.6.7=颁发者短未知值, CN=\ 颁发\,者\+根\\CA\ '
+
+# Subjects of the validity-time fixtures (all self-signed).
+CENTURY_SUBJECT='C=CN, O=Trustpeek Test Org, CN=century-pivot-1950.example.test'
+MIXED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=mixed-year-tags-49-2050.example.test'
+GENERALIZED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=generalized-2050.example.test'
+REVERSE_SUBJECT='C=CN, O=Trustpeek Test Org, CN=reverse-tag-order.example.test'
 
 write_expected_valid() {  # $1 = encoding, $2 = output file
     {
@@ -129,6 +139,67 @@ write_expected_longoid() {  # $1 = encoding, $2 = output file
         printf 'SHA-256 Fingerprint: %s\n' "$LONGOID_FINGERPRINT"
         printf '%s\n' "$NOTE"
     } >"$2"
+}
+
+# Builds the full expected output of one self-signed validity-time fixture:
+# $1 = encoding, $2 = output file, $3 = subject, $4 = Not Before,
+# $5 = Not After, $6 = SHA-256 fingerprint.
+write_expected_time() {
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$3"
+        printf 'Issuer: %s\n' "$3"
+        printf 'Not Before: %s\n' "$4"
+        printf 'Not After: %s\n' "$5"
+        printf 'SHA-256 Fingerprint: %s\n' "$6"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+write_expected_century() {  # $1 = encoding, $2 = output file
+    write_expected_time "$1" "$2" "$CENTURY_SUBJECT" \
+        '1950-01-01T00:00:00Z' '1952-02-29T23:59:59Z' "$CENTURY_FINGERPRINT"
+}
+
+write_expected_mixed() {  # $1 = encoding, $2 = output file
+    write_expected_time "$1" "$2" "$MIXED_SUBJECT" \
+        '2049-12-31T23:30:45Z' '2050-01-01T00:30:59Z' "$MIXED_FINGERPRINT"
+}
+
+write_expected_generalized() {  # $1 = encoding, $2 = output file
+    write_expected_time "$1" "$2" "$GENERALIZED_SUBJECT" \
+        '2052-02-29T03:04:05Z' '2100-12-31T23:59:59Z' "$GENERALIZED_FINGERPRINT"
+}
+
+write_expected_reverse() {  # $1 = encoding, $2 = output file
+    write_expected_time "$1" "$2" "$REVERSE_SUBJECT" \
+        '1949-01-01T00:00:00Z' '1950-06-15T12:00:00Z' "$REVERSE_FINGERPRINT"
+}
+
+# Structural guards for a validity-time output ($1 = captured stdout file,
+# $2 = expected Not Before, $3 = expected Not After). The byte-for-byte
+# comparison already pins everything; these restate the time-specific
+# properties by name so a regression is explained rather than shown as a raw
+# diff: the two moments stay on their own lines in certificate order, and
+# each line has the full canonical YYYY-MM-DDTHH:MM:SSZ shape.
+assert_time_structure() {
+    out=$1
+    want_before=$2
+    want_after=$3
+    before=$(sed -n 's/^Not Before: //p' "$out")
+    after=$(sed -n 's/^Not After: //p' "$out")
+    [ "$before" = "$want_before" ] ||
+        fail "Not Before rendered as '$before', expected '$want_before'"
+    [ "$after" = "$want_after" ] ||
+        fail "Not After rendered as '$after', expected '$want_after'"
+    [ "$before" != "$after" ] ||
+        fail "Not Before and Not After must not collapse into one line"
+    bad=$(printf '%s\n%s\n' "$before" "$after" |
+              grep -vcE '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$')
+    [ "$bad" -eq 0 ] ||
+        fail "validity times must be full YYYY-MM-DDTHH:MM:SSZ UTC strings"
+    grep -qF "$NOTE" "$out" ||
+        fail "output must keep the no-trust-verification Note"
 }
 
 # Structural guards for the long-OID output ($1 = captured stdout file).
@@ -276,6 +347,16 @@ assert_names_structure() {
 fail() {
     echo "FAIL: $CASE: $1" >&2
     exit 1
+}
+
+# Run `trustpeek inspect $2` with TZ=$1; leaves the result in rc and the
+# captured streams in $TMP/stdout / $TMP/stderr (same layout as
+# expect_success so the usual assertions can follow).
+run_with_tz() {
+    tz=$1
+    file=$2
+    TZ="$tz" "$BIN" inspect "$file" >"$TMP/stdout" 2>"$TMP/stderr"
+    rc=$?
 }
 
 # Run `trustpeek inspect $1` and require exit 0, empty stderr, and stdout
@@ -561,6 +642,195 @@ case "$CASE" in
         pem_issuer=$(sed -n 's/^Issuer: //p' "$TMP/pem.out")
         [ "$pem_subject" != "$pem_issuer" ] ||
             fail "longoid fixture must have different subject and issuer"
+        ;;
+
+    # --- Validity-time rendering -------------------------------------
+
+    time_century_utc_der)
+        # Both fields are UTCTime 2-digit years: YY=50 must be 1950 and the
+        # valid leap day 1952-02-29 keeps its hours/minutes/seconds. The
+        # certificate is long expired yet still displays with exit 0.
+        write_expected_century DER "$TMP/expected"
+        expect_success "$FIXTURES/century.der" "$TMP/expected"
+        assert_time_structure "$TMP/expected" \
+            '1950-01-01T00:00:00Z' '1952-02-29T23:59:59Z'
+        ;;
+
+    time_century_utc_pem)
+        # Same certificate as PEM: reported PEM, every other field identical.
+        write_expected_century PEM "$TMP/expected"
+        expect_success "$FIXTURES/century.pem" "$TMP/expected"
+        assert_time_structure "$TMP/expected" \
+            '1950-01-01T00:00:00Z' '1952-02-29T23:59:59Z'
+        ;;
+
+    time_pivot_49_and_50)
+        # The RFC 5280 century pivot sits between 49 and 50. Across the two
+        # fixtures both boundary years appear as UTCTime: 49 -> 2049 (in
+        # mixedyears) and 50 -> 1950 (in century); pin each line so a reader
+        # using a wrong pivot (e.g. 1970) fails.
+        "$BIN" inspect "$FIXTURES/mixedyears.der" >"$TMP/mixed.out" 2>/dev/null ||
+            fail "mixedyears inspect failed"
+        "$BIN" inspect "$FIXTURES/century.der" >"$TMP/century.out" 2>/dev/null ||
+            fail "century inspect failed"
+        grep -qx 'Not Before: 2049-12-31T23:30:45Z' "$TMP/mixed.out" ||
+            fail "UTCTime year 49 must render as 2049"
+        grep -qx 'Not After: 2050-01-01T00:30:59Z' "$TMP/mixed.out" ||
+            fail "GeneralizedTime 2050 must render with its full year"
+        grep -qx 'Not Before: 1950-01-01T00:00:00Z' "$TMP/century.out" ||
+            fail "UTCTime year 50 must render as 1950, not 2050"
+        ;;
+
+    time_mixed_tags_der)
+        # One certificate, two time tags: notBefore UTCTime "49" (2049),
+        # notAfter GeneralizedTime 2050. Each line must follow its OWN tag,
+        # in certificate order; the seconds are nonzero on both lines.
+        write_expected_mixed DER "$TMP/expected"
+        expect_success "$FIXTURES/mixedyears.der" "$TMP/expected"
+        assert_time_structure "$TMP/expected" \
+            '2049-12-31T23:30:45Z' '2050-01-01T00:30:59Z'
+        ;;
+
+    time_mixed_tags_pem)
+        write_expected_mixed PEM "$TMP/expected"
+        expect_success "$FIXTURES/mixedyears.pem" "$TMP/expected"
+        assert_time_structure "$TMP/expected" \
+            '2049-12-31T23:30:45Z' '2050-01-01T00:30:59Z'
+        ;;
+
+    time_mixed_tags_not_swapped)
+        # The two lines must not be interpreted by one shared year rule or
+        # emitted in swapped order: line 4 is Not Before (2049 UTCTime) and
+        # line 5 is Not After (2050 GeneralizedTime), exact and ordered.
+        "$BIN" inspect "$FIXTURES/mixedyears.der" >"$TMP/out" 2>/dev/null ||
+            fail "mixedyears inspect failed"
+        sed -n '4p' "$TMP/out" | grep -qx 'Not Before: 2049-12-31T23:30:45Z' ||
+            fail "line 4 must be the UTCTime Not Before (2049), got: $(sed -n '4p' "$TMP/out")"
+        sed -n '5p' "$TMP/out" | grep -qx 'Not After: 2050-01-01T00:30:59Z' ||
+            fail "line 5 must be the GeneralizedTime Not After (2050), got: $(sed -n '5p' "$TMP/out")"
+        # Reversing the tag order (GeneralizedTime first, UTCTime second)
+        # must render each line by its own tag as well.
+        write_expected_reverse DER "$TMP/reverse.expected"
+        expect_success "$FIXTURES/reverseorder.der" "$TMP/reverse.expected"
+        assert_time_structure "$TMP/reverse.expected" \
+            '1949-01-01T00:00:00Z' '1950-06-15T12:00:00Z'
+        ;;
+
+    time_generalized_der)
+        # Full 4-digit years at/after 2050 (GeneralizedTime): the valid leap
+        # day 2052-02-29 with nonzero h/m/s, and 2100. Not yet valid -> still
+        # displayed, exit 0.
+        write_expected_generalized DER "$TMP/expected"
+        expect_success "$FIXTURES/generalized.der" "$TMP/expected"
+        assert_time_structure "$TMP/expected" \
+            '2052-02-29T03:04:05Z' '2100-12-31T23:59:59Z'
+        ;;
+
+    time_generalized_pem)
+        write_expected_generalized PEM "$TMP/expected"
+        expect_success "$FIXTURES/generalized.pem" "$TMP/expected"
+        assert_time_structure "$TMP/expected" \
+            '2052-02-29T03:04:05Z' '2100-12-31T23:59:59Z'
+        ;;
+
+    time_pem_der_same_fields)
+        # Same certificate saved as PEM and DER: identical times and all
+        # other public fields, differing only in the Encoding line.
+        for stem in century mixedyears generalized reverseorder; do
+            "$BIN" inspect "$FIXTURES/$stem.pem" >"$TMP/$stem.pem.out" 2>"$TMP/$stem.pem.err"
+            rc=$?
+            [ "$rc" -eq 0 ] || fail "$stem PEM inspect failed with $rc"
+            [ -s "$TMP/$stem.pem.err" ] && fail "$stem PEM stderr not empty: $(cat "$TMP/$stem.pem.err")"
+            "$BIN" inspect "$FIXTURES/$stem.der" >"$TMP/$stem.der.out" 2>"$TMP/$stem.der.err"
+            rc=$?
+            [ "$rc" -eq 0 ] || fail "$stem DER inspect failed with $rc"
+            [ -s "$TMP/$stem.der.err" ] && fail "$stem DER stderr not empty: $(cat "$TMP/$stem.der.err")"
+            head -n 1 "$TMP/$stem.pem.out" | grep -qx 'Encoding: PEM' ||
+                fail "$stem PEM not reported as PEM"
+            head -n 1 "$TMP/$stem.der.out" | grep -qx 'Encoding: DER' ||
+                fail "$stem DER not reported as DER"
+            tail -n +2 "$TMP/$stem.pem.out" >"$TMP/$stem.pem.fields"
+            tail -n +2 "$TMP/$stem.der.out" >"$TMP/$stem.der.fields"
+            cmp -s "$TMP/$stem.pem.fields" "$TMP/$stem.der.fields" ||
+                fail "$stem PEM and DER runs disagree outside the Encoding line"
+        done
+        ;;
+
+    time_timezone_invariant)
+        # The complete stdout must be identical under UTC, a timezone ahead
+        # of UTC and one behind UTC. The moments straddle the 2049/2050 New
+        # Year boundary: ahead-of-UTC local time pushes the Not Before over
+        # the year boundary, behind-UTC local time pulls the Not After back.
+        # POSIX TZ strings need no tzdata: UTC-14 is 14h AHEAD of UTC and
+        # UTC+05:30 is 5h30 BEHIND UTC; half-hour offsets and the boundary
+        # crossings are part of the guarantee.
+        write_expected_mixed DER "$TMP/expected"
+        first=
+        for tz in UTC UTC-14 UTC+05:30 UTC+14; do
+            run_with_tz "$tz" "$FIXTURES/mixedyears.der"
+            [ "$rc" -eq 0 ] ||
+                fail "inspect under TZ=$tz exited $rc (stderr: $(cat "$TMP/stderr"))"
+            [ -s "$TMP/stderr" ] &&
+                fail "inspect under TZ=$tz wrote stderr: $(cat "$TMP/stderr")"
+            cmp -s "$TMP/expected" "$TMP/stdout" ||
+                fail "output under TZ=$tz differs from the UTC expectation"
+            if [ -z "$first" ]; then
+                first=$tz
+                cp "$TMP/stdout" "$TMP/tz.first"
+            else
+                cmp -s "$TMP/tz.first" "$TMP/stdout" ||
+                    fail "output under TZ=$tz differs from TZ=$first"
+            fi
+        done
+        # The UTC dates must survive even though local dates cross a
+        # boundary: prove the chosen offsets really cross it in local time.
+        [ "$(TZ=UTC-14 date -d '2049-12-31 23:30:45 UTC' '+%Y')" = 2050 ] ||
+            fail "test setup: UTC-14 must push 2049-12-31T23:30:45Z into 2050 local"
+        [ "$(TZ=UTC+05:30 date -d '2050-01-01 00:30:59 UTC' '+%Y')" = 2049 ] ||
+            fail "test setup: UTC+05:30 must pull 2050-01-01T00:30:59Z back to 2049 local"
+        grep -qx 'Not Before: 2049-12-31T23:30:45Z' "$TMP/tz.first" &&
+            grep -qx 'Not After: 2050-01-01T00:30:59Z' "$TMP/tz.first" ||
+            fail "UTC dates must be unchanged despite local boundary crossings"
+        ;;
+
+    time_expired_and_not_yet_valid_ok)
+        # An already expired cert (century, both times in 1950-1952) and a
+        # not-yet-valid cert (generalized, starts 2052) both display and
+        # return 0, with empty stderr and the closing Note. The outcomes are
+        # fixed by the certificates, never by the run date.
+        for pair in "century.der 1950-01-01T00:00:00Z 1952-02-29T23:59:59Z" \
+                    "generalized.der 2052-02-29T03:04:05Z 2100-12-31T23:59:59Z"; do
+            # shellcheck disable=SC2086
+            set -- $pair
+            "$BIN" inspect "$FIXTURES/$1" >"$TMP/out" 2>"$TMP/err"
+            rc=$?
+            [ "$rc" -eq 0 ] || fail "$1 should display and exit 0, got $rc"
+            [ -s "$TMP/err" ] && fail "$1 wrote stderr: $(cat "$TMP/err")"
+            grep -qx "Not Before: $2" "$TMP/out" ||
+                fail "$1 Not Before mismatch"
+            grep -qx "Not After: $3" "$TMP/out" ||
+                fail "$1 Not After mismatch"
+            grep -qF "$NOTE" "$TMP/out" ||
+                fail "$1 must keep the no-trust-verification Note"
+        done
+        ;;
+
+    time_impossible_date_der)
+        # February 30 cannot name a real day. The file is readable and the
+        # rest of the certificate is structurally complete, so this is
+        # invalid certificate CONTENT (exit 1, stderr names it and the path,
+        # stdout completely empty), never a read failure.
+        expect_invalid "$FIXTURES/baddate.der"
+        # expect_invalid leaves the last run's streams in $TMP/stdout|stderr.
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "an impossible date is bad certificate content, not a read failure"
+        ;;
+
+    time_impossible_date_pem)
+        # Same content served as PEM must be classified identically.
+        expect_invalid "$FIXTURES/baddate.pem"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "an impossible date is bad certificate content, not a read failure"
         ;;
 
     empty_file)

@@ -27,6 +27,19 @@ if(BUILD_TESTING)
         der_long_oids
         pem_long_oids
         pem_der_long_oids_same
+        time_century_utc_der
+        time_century_utc_pem
+        time_pivot_49_and_50
+        time_mixed_tags_der
+        time_mixed_tags_pem
+        time_mixed_tags_not_swapped
+        time_generalized_der
+        time_generalized_pem
+        time_pem_der_same_fields
+        time_timezone_invariant
+        time_expired_and_not_yet_valid_ok
+        time_impossible_date_der
+        time_impossible_date_pem
         der_marker_trailing_newline
         der_marker_trailing_pem_block
         pem_marker_second_block

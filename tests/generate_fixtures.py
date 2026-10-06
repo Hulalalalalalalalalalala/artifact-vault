@@ -9,6 +9,7 @@ material (new keys change the fingerprints, so update tests accordingly is
 NOT needed -- fingerprints are derived from the committed DER at test time).
 """
 
+import base64
 from pathlib import Path
 
 from cryptography import x509
@@ -44,6 +45,97 @@ def rdn(oid, value):
     return x509.RelativeDistinguishedName(
         [x509.NameAttribute(oid, value)]
     )
+
+
+# --- Minimal DER helpers for crafting the validity time fields ------------
+#
+# The public builder API cannot express every time case the regression suite
+# pins: it refuses not_before values before 1950, picks each time tag from
+# the year itself (so the "reverse" tag order cannot be built), and cannot
+# emit a syntactically well-formed but impossible date (February 30). The
+# validity is the fifth element of the tbsCertificate SEQUENCE (right after
+# version, serial, signature algorithm and issuer), so a signed certificate
+# can have just that one SEQUENCE rewritten. The rewritten signature is
+# cryptographically invalid, which is irrelevant: inspect never verifies
+# signatures and must display these certificates exactly like any other.
+
+
+def der_tlv(tag, content):
+    length = len(content)
+    if length < 0x80:
+        length_bytes = bytes([length])
+    else:
+        encoded = length.to_bytes((length.bit_length() + 7) // 8, "big")
+        length_bytes = bytes([0x80 | len(encoded)]) + encoded
+    return bytes([tag]) + length_bytes + content
+
+
+def iter_der_elements(data):
+    position = 0
+    elements = []
+    while position < len(data):
+        tag = data[position]
+        position += 1
+        first = data[position]
+        position += 1
+        if first < 0x80:
+            length = first
+        else:
+            count = first & 0x7F
+            length = int.from_bytes(data[position:position + count], "big")
+            position += count
+        elements.append((tag, data[position:position + length]))
+        position += length
+    assert position == len(data)
+    return elements
+
+
+def utc_time_tlv(text):
+    # UTCTime content such as "490601123045Z"; the 2-digit year century pivot
+    # (00-49 -> 2000s, 50-99 -> 1900s) belongs to the reader, not this text.
+    return der_tlv(0x17, text.encode("ascii"))
+
+
+def generalized_time_tlv(text):
+    # GeneralizedTime content such as "20500101000000Z" (4-digit year).
+    return der_tlv(0x18, text.encode("ascii"))
+
+
+def replace_validity(der, not_before_tlv, not_after_tlv):
+    outer = iter_der_elements(der)
+    assert len(outer) == 1 and outer[0][0] == 0x30
+    cert_children = iter_der_elements(outer[0][1])
+    tbs_children = iter_der_elements(cert_children[0][1])
+    first = 1 if tbs_children[0][0] == 0xA0 else 0
+    validity_index = first + 3  # serial, signature, issuer then validity
+    assert tbs_children[validity_index][0] == 0x30
+    rewritten_tbs_children = (
+        tbs_children[:validity_index]
+        + [(0x30, not_before_tlv + not_after_tlv)]
+        + tbs_children[validity_index + 1:]
+    )
+    rewritten_tbs = der_tlv(
+        0x30, b"".join(der_tlv(t, c) for t, c in rewritten_tbs_children)
+    )
+    rebuilt = rewritten_tbs + b"".join(
+        der_tlv(t, c) for t, c in cert_children[1:]
+    )
+    return der_tlv(0x30, rebuilt)
+
+
+def pem_from_der(der):
+    encoded = base64.b64encode(der).decode("ascii")
+    lines = [encoded[i:i + 64] for i in range(0, len(encoded), 64)]
+    return (
+        "-----BEGIN CERTIFICATE-----\n"
+        + "\n".join(lines)
+        + "\n-----END CERTIFICATE-----\n"
+    ).encode("ascii")
+
+
+def write_cert_pair(stem, der):
+    (FIXTURES / f"{stem}.der").write_bytes(der)
+    (FIXTURES / f"{stem}.pem").write_bytes(pem_from_der(der))
 
 
 def make_self_signed(name, not_before, not_after, serial):
@@ -289,6 +381,109 @@ def main():
     (FIXTURES / "longoid.pem").write_bytes(
         long_oid_cert.public_bytes(serialization.Encoding.PEM)
     )
+
+    # --- Validity-time fixtures -----------------------------------------
+    #
+    # These pin how inspect renders the two X.509 time tags:
+    #   * UTCTime (tag 0x17) stores a 2-digit year; RFC 5280 puts the pivot
+    #     between 49 and 50 (YY 00-49 -> 20YY, YY 50-99 -> 19YY);
+    #   * GeneralizedTime (tag 0x18) stores the full 4-digit year and is
+    #     required from year 2050 on.
+    # The certificate builder tags each boundary naturally, so the first
+    # three certs below need no DER surgery; the last two (a tag order the
+    # builder cannot express, and an impossible date) are rewritten.
+    def time_name(cn):
+        return x509.Name(
+            [
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME,
+                                   "Trustpeek Test Org"),
+                x509.NameAttribute(NameOID.COMMON_NAME, cn),
+            ]
+        )
+
+    # Both fields are UTCTime with 2-digit years: "50" must read as 1950 (not
+    # 2050), and the notAfter is the valid leap day 1952-02-29 with hours,
+    # minutes and seconds preserved. The certificate has expired long ago,
+    # which still displays normally with exit code 0.
+    century_name = time_name("century-pivot-1950.example.test")
+    _, century = make_self_signed(
+        century_name,
+        datetime.datetime(1950, 1, 1, 0, 0, 0, tzinfo=utc),
+        datetime.datetime(1952, 2, 29, 23, 59, 59, tzinfo=utc),
+        serial=0x4001,
+    )
+    write_cert_pair("century", century.public_bytes(serialization.Encoding.DER))
+
+    # The two fields use different tags on the same certificate: notBefore is
+    # UTCTime "49" (-> 2049), notAfter is GeneralizedTime 2050. The moments
+    # sit on either side of the 2049/2050 New-Year boundary (with nonzero
+    # seconds), so in a timezone ahead of UTC the notBefore crosses into
+    # 2050 local time and in a timezone behind UTC the notAfter crosses back
+    # into 2049 local time; the UTC output must stay fixed either way.
+    mixed_name = time_name("mixed-year-tags-49-2050.example.test")
+    _, mixed = make_self_signed(
+        mixed_name,
+        datetime.datetime(2049, 12, 31, 23, 30, 45, tzinfo=utc),
+        datetime.datetime(2050, 1, 1, 0, 30, 59, tzinfo=utc),
+        serial=0x4002,
+    )
+    write_cert_pair("mixedyears", mixed.public_bytes(serialization.Encoding.DER))
+
+    # Both fields are GeneralizedTime with full 4-digit years at/after 2050:
+    # the notBefore is the valid leap day 2052-02-29 (with every time unit
+    # nonzero) and the notAfter reaches 2100, so a 2-digit rendering or a
+    # dropped century would be visible. This certificate is not yet valid;
+    # that changes nothing for display.
+    generalized_name = time_name("generalized-2050.example.test")
+    _, generalized = make_self_signed(
+        generalized_name,
+        datetime.datetime(2052, 2, 29, 3, 4, 5, tzinfo=utc),
+        datetime.datetime(2100, 12, 31, 23, 59, 59, tzinfo=utc),
+        serial=0x4003,
+    )
+    write_cert_pair(
+        "generalized", generalized.public_bytes(serialization.Encoding.DER)
+    )
+
+    # Reverse tag order versus mixedyears: notBefore is GeneralizedTime 1949
+    # and notAfter is UTCTime "50" (-> 1950). The builder cannot produce a
+    # date before 1950 nor this tag ordering, so the validity is rewritten in
+    # DER after signing. Each line must follow its OWN tag: rendering by
+    # position (assuming the first field is always UTCTime) either fails or
+    # swaps the two years.
+    reverse_name = time_name("reverse-tag-order.example.test")
+    _, reverse_base = make_self_signed(
+        reverse_name,
+        datetime.datetime(2030, 1, 1, tzinfo=utc),
+        datetime.datetime(2040, 1, 1, tzinfo=utc),
+        serial=0x4004,
+    )
+    reverse_der = replace_validity(
+        reverse_base.public_bytes(serialization.Encoding.DER),
+        generalized_time_tlv("19490101000000Z"),
+        utc_time_tlv("500615120000Z"),
+    )
+    write_cert_pair("reverseorder", reverse_der)
+
+    # Structurally complete certificate whose notAfter claims February 30:
+    # the GeneralizedTime text is well formed but no such date exists. d2i
+    # accepts the structure (so this is certificate CONTENT trouble rather
+    # than an unreadable file) and inspect must fail while converting the
+    # time, reporting "invalid certificate" with exit 1 and empty stdout.
+    baddate_name = time_name("invalid-february-30.example.test")
+    _, baddate_base = make_self_signed(
+        baddate_name,
+        datetime.datetime(2030, 1, 1, tzinfo=utc),
+        datetime.datetime(2040, 1, 1, tzinfo=utc),
+        serial=0x4005,
+    )
+    baddate_der = replace_validity(
+        baddate_base.public_bytes(serialization.Encoding.DER),
+        utc_time_tlv("490228000000Z"),
+        generalized_time_tlv("20500230000000Z"),
+    )
+    write_cert_pair("baddate", baddate_der)
 
 
 if __name__ == "__main__":
