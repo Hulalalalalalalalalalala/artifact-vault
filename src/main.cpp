@@ -85,58 +85,104 @@ bool base64_decode(const std::string& input,
     return true;
 }
 
+// True only for the whitespace permitted outside a PEM block: spaces, tabs,
+// LF newlines and CRLF newlines. A CR is accepted solely as part of CRLF,
+// which the caller enforces by peeking at the following byte. Vertical tabs,
+// form feeds and any other byte stay rejected even though std::isspace()
+// would accept some of them.
+bool is_outer_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+// Finds marker in content starting at offset while skipping outer whitespace.
+// Whitespace may occupy whole lines or sit directly next to the marker on the
+// marker's own line. A bare CR (not followed by LF) is not accepted.
+size_t find_marker_with_outer_ws(std::string_view content, size_t offset,
+                                 std::string_view marker) {
+    const size_t n = content.size();
+    size_t i = offset;
+    while (i < n) {
+        if (content.compare(i, marker.size(), marker) == 0) {
+            return i;
+        }
+        char c = content[i];
+        if (c == '\r') {
+            if (i + 1 >= n || content[i + 1] != '\n') {
+                return std::string_view::npos;
+            }
+            i += 2;
+        } else if (c == ' ' || c == '\t' || c == '\n') {
+            ++i;
+        } else {
+            return std::string_view::npos;
+        }
+    }
+    return std::string_view::npos;
+}
+
+// True when content[from..end) holds nothing but outer whitespace: spaces,
+// tabs and LF/CRLF newlines. A bare CR (not followed by LF) is rejected.
+bool only_outer_whitespace(std::string_view content, size_t from) {
+    const size_t n = content.size();
+    for (size_t i = from; i < n; ++i) {
+        if (!is_outer_space(content[i])) return false;
+        if (content[i] == '\r' &&
+            (i + 1 >= n || content[i + 1] != '\n')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Verifies that the content is exactly one PEM certificate block surrounded
-// by nothing but whitespace, and that the base64 payload is the given DER.
+// by nothing but whitespace (spaces, tabs, LF and CRLF, on their own lines or
+// directly beside the markers), and that the base64 payload is the given DER.
 bool validate_single_pem(std::string_view content,
                          const std::vector<unsigned char>& der) {
-    enum class State { BeforeMarker, InBody, AfterMarker };
-    State state = State::BeforeMarker;
+    size_t begin = find_marker_with_outer_ws(content, 0, kPemBegin);
+    if (begin == std::string_view::npos) return false;
+    size_t body_start = begin + kPemBegin.size();
+
+    size_t end = content.find(kPemEnd, body_start);
+    if (end == std::string_view::npos) return false;
+
+    // Anything after the end marker must be outer whitespace as well, so a
+    // second block or any other text fails here.
+    if (!only_outer_whitespace(content, end + kPemEnd.size())) return false;
+
+    // Body lines keep the existing rules: a trailing CR closes a CRLF line
+    // and horizontal whitespace may surround the base64 on each line. The
+    // cut at `end` lets whitespace hug the end marker on its own line.
     std::string base64;
-    size_t start = 0;
-    while (true) {
+    size_t start = body_start;
+    while (start < end) {
         size_t newline = content.find('\n', start);
-        std::string_view line = content.substr(
-            start, newline == std::string_view::npos ? std::string_view::npos
-                                                     : newline - start);
+        size_t line_end =
+            (newline == std::string_view::npos || newline > end)
+                ? end
+                : newline;
+        std::string_view line = content.substr(start, line_end - start);
         if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-        size_t begin = 0;
-        size_t end = line.size();
-        while (begin < end &&
-               std::isspace(static_cast<unsigned char>(line[begin]))) {
-            ++begin;
+        size_t lb = 0;
+        size_t le = line.size();
+        while (lb < le &&
+               std::isspace(static_cast<unsigned char>(line[lb]))) {
+            ++lb;
         }
-        while (end > begin &&
-               std::isspace(static_cast<unsigned char>(line[end - 1]))) {
-            --end;
+        while (le > lb &&
+               std::isspace(static_cast<unsigned char>(line[le - 1]))) {
+            --le;
         }
-        std::string_view trimmed = line.substr(begin, end - begin);
-
-        switch (state) {
-            case State::BeforeMarker:
-                if (!trimmed.empty()) {
-                    if (trimmed != kPemBegin) return false;
-                    state = State::InBody;
-                }
-                break;
-            case State::InBody:
-                if (trimmed == kPemEnd) {
-                    state = State::AfterMarker;
-                } else if (!trimmed.empty()) {
-                    for (char c : trimmed) {
-                        if (!is_base64_token(c)) return false;
-                    }
-                    base64.append(trimmed);
-                }
-                break;
-            case State::AfterMarker:
-                if (!trimmed.empty()) return false;
-                break;
+        std::string_view trimmed = line.substr(lb, le - lb);
+        if (!trimmed.empty()) {
+            for (char c : trimmed) {
+                if (!is_base64_token(c)) return false;
+            }
+            base64.append(trimmed);
         }
-
-        if (newline == std::string_view::npos) break;
-        start = newline + 1;
+        if (line_end == end) break;
+        start = line_end + 1;
     }
-    if (state != State::AfterMarker) return false;
 
     std::vector<unsigned char> decoded;
     return base64_decode(base64, decoded) && decoded == der;
@@ -452,8 +498,19 @@ int inspect_file(const std::string& path) {
             return 1;
         }
     } else {
-        BioPtr bio(BIO_new_mem_buf(content.data(),
-                                  static_cast<int>(content.size())),
+        // PEM markers may be preceded by outer whitespace that hugs the
+        // marker on its own line; OpenSSL itself only recognizes a marker at
+        // a line start, so point the reader at the first marker. Acceptance
+        // of whatever precedes or follows it is decided below by the strict
+        // whole-content validator, never by OpenSSL's lenient reader.
+        size_t marker = find_marker_with_outer_ws(content, 0, kPemBegin);
+        const char* pem_data = content.data();
+        size_t pem_size = content.size();
+        if (marker != std::string_view::npos) {
+            pem_data += marker;
+            pem_size -= marker;
+        }
+        BioPtr bio(BIO_new_mem_buf(pem_data, static_cast<int>(pem_size)),
                    BIO_free_all);
         if (!bio) {
             std::cerr << "trustpeek: internal error while reading '" << path

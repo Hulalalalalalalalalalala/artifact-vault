@@ -17,6 +17,7 @@ if(BUILD_TESTING)
         pem_wrong_extension
         der_wrong_extension
         pem_surrounding_whitespace
+        pem_hugging_whitespace
         expired_ok
         self_signed_ok
         der_marker_in_name
@@ -53,6 +54,7 @@ if(BUILD_TESTING)
         pem_second_block
         pem_text_before
         pem_text_after
+        pem_text_hugging_marker
         pem_body_trailing_nul
         pem_body_trailing_cert
         pem_body_exact_with_whitespace

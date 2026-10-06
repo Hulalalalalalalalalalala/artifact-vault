@@ -666,6 +666,41 @@ case "$CASE" in
         expect_success "$TMP/whitespace.pem" "$TMP/expected"
         ;;
 
+    pem_hugging_whitespace)
+        # Outer whitespace is allowed DIRECTLY NEXT TO the markers on the
+        # markers' own lines, not only on separate blank lines: leading
+        # spaces/tabs before BEGIN, trailing spaces/tabs after END, mixed LF
+        # and CRLF runs, and no newline at all after the final whitespace.
+        # The output must be byte-identical to the plain PEM (and, outside
+        # Encoding, to the DER) file; the added whitespace never enters the
+        # fingerprint.
+        total=$(wc -l < "$FIXTURES/valid.pem")
+        {
+            printf '  \t '
+            sed -n '1{s/$/\r/;p;q}' "$FIXTURES/valid.pem"
+            sed -n "2,$((total - 1))p" "$FIXTURES/valid.pem"
+            printf -- '-----END CERTIFICATE-----  \t'
+            printf ' \r\n\t\n  '
+        } >"$TMP/hugging.pem"
+        # Sanity-check the shape of the constructed file.
+        expected_first=$(printf '  \t -----BEGIN CERTIFICATE-----\r')
+        [ "$(head -1 "$TMP/hugging.pem")" = "$expected_first" ] ||
+            fail "BEGIN marker must be preceded by whitespace on its own line"
+        write_expected_valid PEM "$TMP/expected"
+        expect_success "$TMP/hugging.pem" "$TMP/expected"
+        "$BIN" inspect "$FIXTURES/valid.pem" >"$TMP/plain.out" 2>/dev/null ||
+            fail "plain PEM must succeed"
+        "$BIN" inspect "$TMP/hugging.pem" >"$TMP/hug.out" 2>/dev/null
+        cmp -s "$TMP/hug.out" "$TMP/plain.out" ||
+            fail "hugging-whitespace output must be byte-identical to plain PEM"
+        "$BIN" inspect "$FIXTURES/valid.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        [ ! -s "$TMP/der.err" ] || fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        tail -n +2 "$TMP/hug.out" >"$TMP/hug.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/hug.fields" "$TMP/der.fields" ||
+            fail "hugging PEM and DER must agree in every field but Encoding"
+        ;;
+
     expired_ok)
         # An expired but complete certificate still displays and exits 0.
         {
@@ -1087,6 +1122,19 @@ case "$CASE" in
     pem_text_after)
         { cat "$FIXTURES/valid.pem"; printf 'trailing comment\n'; } >"$TMP/text-after.pem"
         expect_invalid "$TMP/text-after.pem"
+        ;;
+
+    pem_text_hugging_marker)
+        # Only the four outer whitespace bytes may hug a marker on its own
+        # line: visible text glued before BEGIN or after END is still
+        # non-whitespace content outside the block, and a bare CR (not CRLF)
+        # is not an accepted newline. All must be invalid certificates.
+        { printf '  x-----BEGIN CERTIFICATE-----\n'; tail -n +2 "$FIXTURES/valid.pem"; } >"$TMP/hug-before.pem"
+        expect_invalid "$TMP/hug-before.pem"
+        { head -n -1 "$FIXTURES/valid.pem"; printf -- '-----END CERTIFICATE----- x\n'; } >"$TMP/hug-after.pem"
+        expect_invalid "$TMP/hug-after.pem"
+        { printf ' \r-----BEGIN CERTIFICATE-----\n'; tail -n +2 "$FIXTURES/valid.pem"; } >"$TMP/bare-cr.pem"
+        expect_invalid "$TMP/bare-cr.pem"
         ;;
 
     pem_body_trailing_nul)
