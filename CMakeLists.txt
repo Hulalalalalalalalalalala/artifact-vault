@@ -66,6 +66,12 @@ if(BUILD_TESTING)
         pem_surrounding_whitespace
         expired_ok
         self_signed_ok
+        badsign_pem
+        badsign_der
+        badsign_pem_der_same_fields
+        badsign_same_fields_as_valid
+        badsign_signature_really_invalid
+        badsign_der_truncated
         der_marker_in_name
         pem_marker_in_name
         der_complex_names

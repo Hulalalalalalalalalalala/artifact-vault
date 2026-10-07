@@ -80,6 +80,7 @@ fingerprint_of() {
         tr 'a-f' 'A-F' | sed 's/\(..\)/\1:/g; s/:$//'
 }
 FINGERPRINT=$(fingerprint_of "$FIXTURES/valid.der")
+BADSIGN_FINGERPRINT=$(fingerprint_of "$FIXTURES/badsign.der")
 EXPIRED_FINGERPRINT=$(fingerprint_of "$FIXTURES/expired.der")
 MARKER_FINGERPRINT=$(fingerprint_of "$FIXTURES/marker.der")
 NAMES_FINGERPRINT=$(fingerprint_of "$FIXTURES/names.der")
@@ -185,6 +186,22 @@ write_expected_valid() {  # $1 = encoding, $2 = output file
         printf 'Not Before: 2020-01-01T00:00:00Z\n'
         printf 'Not After: 2040-01-01T00:00:00Z\n'
         printf 'SHA-256 Fingerprint: %s\n' "$FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+# The tampered-signature certificate (badsign.*) shares every informational
+# field with valid.* -- same subject, issuer, validity, public key and
+# signature algorithm; only the signature content (and therefore the
+# fingerprint) differs.
+write_expected_badsign() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$VALID_SUBJECT"
+        printf 'Issuer: %s\n' "$VALID_SUBJECT"
+        printf 'Not Before: 2020-01-01T00:00:00Z\n'
+        printf 'Not After: 2040-01-01T00:00:00Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$BADSIGN_FINGERPRINT"
         printf '%s\n' "$NOTE"
     } >"$2"
 }
@@ -928,6 +945,217 @@ case "$CASE" in
             fail "fixture should be self-signed (subject == issuer)"
         grep -qF "$NOTE" "$TMP/stdout" ||
             fail "output must keep the no-trust-verification Note"
+        ;;
+
+    # --- Invalid signature still displays -------------------------------
+    # badsign.* is a complete X.509 certificate identical to valid.* in
+    # subject, issuer, validity, public key and signature algorithm; only
+    # the signature content was altered after signing, so verification
+    # genuinely fails (proven by badsign_signature_really_invalid). inspect
+    # reads information without verifying signatures: both certificates
+    # must display and exit 0, and neither output may claim the signature
+    # is valid or trusted -- the byte-for-byte expected files pin the exact
+    # output, including the closing no-trust Note.
+
+    badsign_pem)
+        write_expected_badsign PEM "$TMP/expected"
+        expect_success "$FIXTURES/badsign.pem" "$TMP/expected"
+        ;;
+
+    badsign_der)
+        write_expected_badsign DER "$TMP/expected"
+        expect_success "$FIXTURES/badsign.der" "$TMP/expected"
+        ;;
+
+    badsign_pem_der_same_fields)
+        # The invalid-signature certificate saved as PEM and as DER: the
+        # Encoding line reports the real format, everything else agrees.
+        "$BIN" inspect "$FIXTURES/badsign.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/badsign.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree on subject/issuer/validity/fingerprint"
+        grep -qF "$NOTE" "$TMP/pem.out" ||
+            fail "output must keep the no-trust-verification Note"
+        ;;
+
+    badsign_same_fields_as_valid)
+        # The two certificates share subject, issuer, validity, public key
+        # and signature algorithm: those rendered lines must be identical,
+        # while the SHA-256 fingerprints differ because the signature is
+        # part of the certificate bytes each fingerprint is computed over.
+        "$BIN" inspect "$FIXTURES/valid.pem" >"$TMP/valid.out" 2>"$TMP/valid.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "valid.pem inspect failed with $rc"
+        [ -s "$TMP/valid.err" ] &&
+            fail "valid.pem stderr not empty: $(cat "$TMP/valid.err")"
+        "$BIN" inspect "$FIXTURES/badsign.pem" >"$TMP/badsign.out" 2>"$TMP/badsign.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "badsign.pem inspect failed with $rc"
+        [ -s "$TMP/badsign.err" ] &&
+            fail "badsign.pem stderr not empty: $(cat "$TMP/badsign.err")"
+        sed -n '2,5p' "$TMP/valid.out" >"$TMP/valid.fields"
+        sed -n '2,5p' "$TMP/badsign.out" >"$TMP/badsign.fields"
+        cmp -s "$TMP/valid.fields" "$TMP/badsign.fields" ||
+            fail "subject/issuer/validity lines must be identical for the two certificates"
+        grep -qx "SHA-256 Fingerprint: $FINGERPRINT" "$TMP/valid.out" ||
+            fail "valid.pem must show the fingerprint of its own complete DER encoding"
+        grep -qx "SHA-256 Fingerprint: $BADSIGN_FINGERPRINT" "$TMP/badsign.out" ||
+            fail "badsign.pem must show the fingerprint of its own complete DER encoding"
+        [ "$FINGERPRINT" != "$BADSIGN_FINGERPRINT" ] ||
+            fail "the two certificates must have different SHA-256 fingerprints"
+        grep -qF "$NOTE" "$TMP/valid.out" ||
+            fail "valid.pem output must keep the no-trust-verification Note"
+        grep -qF "$NOTE" "$TMP/badsign.out" ||
+            fail "badsign.pem output must keep the no-trust-verification Note"
+        ;;
+
+    badsign_signature_really_invalid)
+        # The invalid signature must be a genuine property of the fixture
+        # input -- self-signedness, identical names or expiry cannot stand
+        # in for it. Prove offline, with the Python standard library only
+        # (no cryptography package, no network, no system trust store, no
+        # dependence on the current date), that:
+        #   * both certificates carry the SAME tbsCertificate bytes (same
+        #     subject, issuer, validity, public key, signature algorithm)
+        #     and differ only in the signature content;
+        #   * valid.der's signature verifies under its own RSA public key
+        #     (PKCS#1 v1.5 with SHA-256);
+        #   * badsign.der's signature does NOT verify under the same key.
+        if ! python3 - "$FIXTURES/valid.der" "$FIXTURES/badsign.der" <<'EOF'
+import hashlib
+import sys
+
+
+def fail(message):
+    print(f"fixture precondition failed: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def read_tlv(data, pos):
+    start = pos
+    tag = data[pos]
+    pos += 1
+    first = data[pos]
+    pos += 1
+    if first < 0x80:
+        length = first
+    else:
+        count = first & 0x7F
+        length = int.from_bytes(data[pos:pos + count], "big")
+        pos += count
+    end = pos + length
+    return tag, data[pos:end], data[start:end], end
+
+
+def parse_cert(path):
+    with open(path, "rb") as handle:
+        der = handle.read()
+    tag, content, _, end = read_tlv(der, 0)
+    if tag != 0x30 or end != len(der):
+        fail(f"{path}: outer SEQUENCE must span the whole file")
+    children = []
+    pos = 0
+    while pos < len(content):
+        child_tag, child_content, child_tlv, pos = read_tlv(content, pos)
+        children.append((child_tag, child_content, child_tlv))
+    if len(children) != 3:
+        fail(f"{path}: a certificate must have exactly 3 top-level elements")
+    return children
+
+
+valid = parse_cert(sys.argv[1])
+badsign = parse_cert(sys.argv[2])
+
+# tbsCertificate (index 0) and signatureAlgorithm (index 1) must be
+# byte-identical; only the signatureValue BIT STRING (index 2) may differ.
+if valid[0][2] != badsign[0][2]:
+    fail("the two certificates must share the same tbsCertificate bytes")
+if valid[1][2] != badsign[1][2]:
+    fail("the two certificates must use the same signature algorithm")
+if valid[2][1] == badsign[2][1]:
+    fail("the signature content must differ between the two certificates")
+
+tbs_tlv = valid[0][2]
+# sha256WithRSAEncryption (1.2.840.113549.1.1.11) is what the RSA check
+# below implements.
+if b"\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b" not in valid[1][1]:
+    fail("fixtures must be signed with sha256WithRSAEncryption")
+
+# SubjectPublicKeyInfo is the seventh tbsCertificate element (after the
+# explicit version tag, serial number, signature algorithm, issuer,
+# validity and subject).
+tbs_children = []
+pos = 0
+while pos < len(valid[0][1]):
+    child_tag, child_content, _, pos = read_tlv(valid[0][1], pos)
+    tbs_children.append((child_tag, child_content))
+if tbs_children[0][0] != 0xA0 or len(tbs_children) < 7:
+    fail("unexpected tbsCertificate layout")
+spki = tbs_children[6][1]
+_, _, _, pos = read_tlv(spki, 0)  # algorithm identifier
+tag, bit_string, _, pos = read_tlv(spki, pos)
+if tag != 0x03 or pos != len(spki) or bit_string[0] != 0:
+    fail("unexpected subjectPublicKey BIT STRING")
+# RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+tag, key_content, _, _ = read_tlv(bit_string, 1)
+if tag != 0x30:
+    fail("unexpected RSAPublicKey structure")
+tag, modulus, _, pos = read_tlv(key_content, 0)
+tag2, exponent, _, pos2 = read_tlv(key_content, pos)
+if tag != 0x02 or tag2 != 0x02 or pos2 != len(key_content):
+    fail("unexpected RSAPublicKey structure")
+n = int.from_bytes(modulus, "big")
+e = int.from_bytes(exponent, "big")
+
+DIGEST_INFO_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def rsa_pkcs1v15_verifies(signature_bit_string):
+    if signature_bit_string[0] != 0:
+        fail("signature BIT STRING must have zero unused bits")
+    signature = int.from_bytes(signature_bit_string[1:], "big")
+    key_size = (n.bit_length() + 7) // 8
+    em = pow(signature, e, n).to_bytes(key_size, "big")
+    expected = (
+        b"\x00\x01"
+        + b"\xff" * (key_size - len(DIGEST_INFO_PREFIX) - 32 - 3)
+        + b"\x00"
+        + DIGEST_INFO_PREFIX
+        + hashlib.sha256(tbs_tlv).digest()
+    )
+    return em == expected
+
+
+if not rsa_pkcs1v15_verifies(valid[2][1]):
+    fail("the original certificate's signature must verify")
+if rsa_pkcs1v15_verifies(badsign[2][1]):
+    fail("the tampered certificate's signature must NOT verify")
+EOF
+        then
+            fail "the badsign fixture's invalid signature is not a genuine input property"
+        fi
+        ;;
+
+    badsign_der_truncated)
+        # Allowing an invalid signature must not blur the boundary with
+        # corrupted data: a truncated, no longer parseable certificate is
+        # still a content error (exit 1, empty stdout, invalid-certificate
+        # diagnostic naming the path), never a successful read.
+        size=$(wc -c <"$FIXTURES/badsign.der")
+        head -c $((size / 2)) "$FIXTURES/badsign.der" >"$TMP/truncated.der"
+        expect_invalid "$TMP/truncated.der"
         ;;
 
     der_marker_in_name)

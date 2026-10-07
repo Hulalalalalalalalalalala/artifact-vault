@@ -55,6 +55,7 @@ fi
 # are decoded; everything else found as *.pem is copied verbatim.
 CERT_STEMS='
 valid
+badsign
 expired
 marker
 names

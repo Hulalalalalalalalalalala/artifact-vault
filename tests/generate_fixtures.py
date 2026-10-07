@@ -22,8 +22,9 @@ import base64
 from pathlib import Path
 
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.x509.oid import NameOID, ObjectIdentifier
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -130,6 +131,66 @@ def replace_validity(der, not_before_tlv, not_after_tlv):
         der_tlv(t, c) for t, c in cert_children[1:]
     )
     return der_tlv(0x30, rebuilt)
+
+
+def tamper_signature(der):
+    """Flip one bit in the signatureValue of an already-signed certificate.
+
+    The tbsCertificate (subject, issuer, validity, public key and the
+    signature algorithm) stays byte-for-byte identical; only the signature
+    CONTENT changes, so the result is still a complete, fully parseable
+    X.509 certificate whose signature genuinely fails verification. inspect
+    reads certificate information without verifying signatures, so this
+    certificate must display exactly like the original -- only its SHA-256
+    fingerprint differs, because the signature is part of the certificate
+    bytes. The caller must assert the verification outcomes (original
+    verifies, tampered fails) with real cryptography.
+    """
+    outer = iter_der_elements(der)
+    assert len(outer) == 1 and outer[0][0] == 0x30
+    cert_children = iter_der_elements(outer[0][1])
+    assert len(cert_children) == 3
+    signature_tag, signature_content = cert_children[2]
+    assert signature_tag == 0x03  # BIT STRING
+    assert signature_content[0] == 0  # zero unused bits
+    tampered = bytearray(signature_content)
+    tampered[-1] ^= 0x01
+    rebuilt = b"".join(
+        der_tlv(tag, content) for tag, content in cert_children[:2]
+    ) + der_tlv(0x03, bytes(tampered))
+    return der_tlv(0x30, rebuilt)
+
+
+def assert_signature_outcomes(original_der, tampered_der):
+    """Prove the tampered certificate's signature really is invalid.
+
+    Both certificates must share the same tbsCertificate bytes (same
+    subject, issuer, validity, public key and signature algorithm) while
+    the original's signature verifies and the tampered one's does not, so
+    the invalid signature is a genuine property of the fixture input rather
+    than a stand-in such as self-signedness, matching names or expiry.
+    """
+    original = x509.load_der_x509_certificate(original_der)
+    tampered = x509.load_der_x509_certificate(tampered_der)
+    assert tampered.tbs_certificate_bytes == original.tbs_certificate_bytes
+    assert tampered.signature != original.signature
+    public_key = original.public_key()
+    public_key.verify(
+        original.signature,
+        original.tbs_certificate_bytes,
+        padding.PKCS1v15(),
+        original.signature_hash_algorithm,
+    )
+    try:
+        public_key.verify(
+            tampered.signature,
+            tampered.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            tampered.signature_hash_algorithm,
+        )
+    except InvalidSignature:
+        return
+    raise AssertionError("tampered signature unexpectedly verifies")
 
 
 # --- DER surgery for DirectoryString name-value encodings ----------------
@@ -651,6 +712,15 @@ def main():
     (FIXTURES / "valid.pem").write_bytes(
         valid.public_bytes(serialization.Encoding.PEM)
     )
+    # A certificate identical to valid.pem in subject, issuer, validity,
+    # public key and signature algorithm, whose signature CONTENT was altered
+    # after signing so verification genuinely fails. Both are complete X.509
+    # certificates; inspect reads information without verifying signatures,
+    # so both must display and exit 0, with different SHA-256 fingerprints
+    # (the signature is part of the certificate bytes).
+    badsign_der = tamper_signature(der)
+    assert_signature_outcomes(der, badsign_der)
+    write_cert_pem("badsign", badsign_der)
     # Single-block PEM files whose base64 body is not exactly one certificate
     # (one trailing zero byte, or a second complete identical certificate).
     write_pem_body_trailing_fixtures(der)
