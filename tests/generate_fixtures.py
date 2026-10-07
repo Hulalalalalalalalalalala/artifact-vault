@@ -24,7 +24,7 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.x509.oid import NameOID, ObjectIdentifier
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -161,7 +161,7 @@ def tamper_signature(der):
     return der_tlv(0x30, rebuilt)
 
 
-def assert_signature_outcomes(original_der, tampered_der):
+def assert_signature_outcomes(original_der, tampered_der, verifier_key=None):
     """Prove the tampered certificate's signature really is invalid.
 
     Both certificates must share the same tbsCertificate bytes (same
@@ -169,25 +169,43 @@ def assert_signature_outcomes(original_der, tampered_der):
     the original's signature verifies and the tampered one's does not, so
     the invalid signature is a genuine property of the fixture input rather
     than a stand-in such as self-signedness, matching names or expiry.
+    Works for both RSA (PKCS#1 v1.5) and EC (ECDSA) keys; the verifier key
+    type selects the verification primitive.
+
+    verifier_key is the public key that signs the certificate. A
+    self-signed certificate omits it (the certificate's own public key
+    verifies it); a certificate signed by a separate issuer (the EC leaf)
+    must pass that issuer's public key explicitly.
     """
     original = x509.load_der_x509_certificate(original_der)
     tampered = x509.load_der_x509_certificate(tampered_der)
     assert tampered.tbs_certificate_bytes == original.tbs_certificate_bytes
     assert tampered.signature != original.signature
-    public_key = original.public_key()
-    public_key.verify(
-        original.signature,
-        original.tbs_certificate_bytes,
-        padding.PKCS1v15(),
-        original.signature_hash_algorithm,
+    public_key = (
+        verifier_key if verifier_key is not None else original.public_key()
     )
+
+    def verify(certificate):
+        if isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(
+                certificate.signature,
+                certificate.tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                certificate.signature_hash_algorithm,
+            )
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            # ECDSA carries the hash inside its signature algorithm object.
+            public_key.verify(
+                certificate.signature,
+                certificate.tbs_certificate_bytes,
+                ec.ECDSA(certificate.signature_hash_algorithm),
+            )
+        else:
+            raise AssertionError("unsupported verifier public key type")
+
+    verify(original)
     try:
-        public_key.verify(
-            tampered.signature,
-            tampered.tbs_certificate_bytes,
-            padding.PKCS1v15(),
-            tampered.signature_hash_algorithm,
-        )
+        verify(tampered)
     except InvalidSignature:
         return
     raise AssertionError("tampered signature unexpectedly verifies")
@@ -682,6 +700,118 @@ def write_name_string_encoding_fixtures():
         )
 
 
+def write_ec_fixtures():
+    """Write the elliptic-curve fixtures: ec_issuer/ec_valid/ec_badsign.
+
+    inspect never restricts the certificate's public key type and never
+    verifies signatures, so its information display must work for an EC
+    certificate exactly as it does for the RSA samples:
+
+      ec_issuer
+          A self-signed P-256 CA certificate (ECDSA with SHA-256). It exists
+          as the fixed carrier of the ISSUER's public key: ec_valid is not
+          self-signed, so its signature cannot be checked against a key in
+          the leaf itself. The pure-stdlib regression proof parses this
+          certificate to obtain the issuer point that verifies the leaf.
+      ec_valid
+          A complete certificate carrying a P-256 subject public key, signed
+          by a DIFFERENT P-256 key (ec_issuer's) with ECDSA and SHA-256.
+          Subject and issuer are distinct fixed names; serial and validity
+          are fixed.
+      ec_badsign
+          The same leaf with one byte of its ECDSA signatureValue flipped
+          after signing. The tbsCertificate (subject, issuer, validity,
+          public key and signature algorithm) is byte-identical to ec_valid;
+          the result is still a complete, parseable X.509 certificate whose
+          signature genuinely fails. The caller asserts the verification
+          outcomes with real elliptic-curve cryptography.
+
+    As with every other fixture, only the PEM is committed and the DER is
+    derived at build time; regeneration rotates the key material but the
+    tests derive the expected fingerprints from the prepared DER bytes.
+    """
+    import datetime
+
+    utc = datetime.timezone.utc
+
+    issuer_name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME,
+                               "Trustpeek EC Test CA"),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME,
+                               "Elliptic Curve Issuer"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "ec-issuer.example.test"),
+        ]
+    )
+    leaf_subject_name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME,
+                               "Trustpeek EC Test Org"),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME,
+                               "Elliptic Curve End Entity"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "ec-valid.example.test"),
+        ]
+    )
+
+    issuer_key = ec.generate_private_key(ec.SECP256R1())
+    subject_key = ec.generate_private_key(ec.SECP256R1())
+
+    not_before = datetime.datetime(2025, 3, 1, tzinfo=utc)
+    not_after = datetime.datetime(2035, 3, 1, tzinfo=utc)
+
+    # A self-signed issuer certificate: a complete, inspectable certificate
+    # in its own right and the fixed source of the issuer public key for the
+    # offline ECDSA verification proof in the regression suite.
+    issuer_cert = (
+        x509.CertificateBuilder()
+        .subject_name(issuer_name)
+        .issuer_name(issuer_name)
+        .public_key(issuer_key.public_key())
+        .serial_number(0x7000)
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .sign(issuer_key, hashes.SHA256())
+    )
+
+    # The leaf carries a P-256 public key but is signed by the separate
+    # issuer P-256 key; subject and issuer therefore differ by construction.
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(leaf_subject_name)
+        .issuer_name(issuer_name)
+        .public_key(subject_key.public_key())
+        .serial_number(0x7001)
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .sign(issuer_key, hashes.SHA256())
+    )
+    leaf_der = leaf.public_bytes(serialization.Encoding.DER)
+
+    assert leaf.subject != leaf.issuer
+    assert leaf.issuer == issuer_cert.subject
+    assert isinstance(leaf.public_key(), ec.EllipticCurvePublicKey)
+    assert isinstance(leaf.public_key().curve, ec.SECP256R1)
+    assert leaf.signature_hash_algorithm.name == "sha256"
+    assert leaf.signature_algorithm_oid == ObjectIdentifier(
+        "1.2.840.10045.4.3.2"
+    )
+
+    leaf_badsign_der = tamper_signature(leaf_der)
+    # The leaf is signed by the separate issuer key, not by its own P-256
+    # subject key, so verification must use the issuer public key.
+    assert_signature_outcomes(
+        leaf_der, leaf_badsign_der, issuer_cert.public_key()
+    )
+
+    write_cert_pem(
+        "ec_issuer", issuer_cert.public_bytes(serialization.Encoding.DER)
+    )
+    write_cert_pem("ec_valid", leaf_der)
+    write_cert_pem("ec_badsign", leaf_badsign_der)
+
+
 def main():
     import datetime
 
@@ -918,6 +1048,7 @@ def main():
 
     write_ctrlchars_fixtures()
     write_name_string_encoding_fixtures()
+    write_ec_fixtures()
 
     # --- Validity-time fixtures -----------------------------------------
     #
