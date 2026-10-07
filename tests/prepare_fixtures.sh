@@ -74,6 +74,8 @@ mixedyears
 generalized
 reverseorder
 baddate
+ec
+ec_badsign
 '
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/trustpeek-fixtures.XXXXXX") || {

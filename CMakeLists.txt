@@ -72,6 +72,16 @@ if(BUILD_TESTING)
         badsign_same_fields_as_valid
         badsign_signature_really_invalid
         badsign_der_truncated
+        ec_pem
+        ec_der
+        ec_pem_der_same_fields
+        ec_badsign_pem
+        ec_der_badsign
+        ec_badsign_pem_der_same_fields
+        ec_badsign_same_fields_as_ec
+        ec_signature_really_invalid
+        ec_badsign_der_truncated
+        ec_badsign_pem_truncated
         der_marker_in_name
         pem_marker_in_name
         der_complex_names

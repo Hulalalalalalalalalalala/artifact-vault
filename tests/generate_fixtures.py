@@ -24,8 +24,8 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.x509.oid import NameOID, ObjectIdentifier
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.x509.oid import NameOID, ObjectIdentifier, SignatureAlgorithmOID
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -191,6 +191,55 @@ def assert_signature_outcomes(original_der, tampered_der):
     except InvalidSignature:
         return
     raise AssertionError("tampered signature unexpectedly verifies")
+
+
+def tamper_ecdsa_signature(original_der, issuer_public_key, tbs_bytes):
+    """Return a complete EC certificate carrying a well-formed but WRONG
+    ECDSA signature.
+
+    The tbsCertificate stays byte-for-byte identical; only signatureValue
+    BIT STRING content is changed. Unlike an RSA PKCS#1 v1.5 block, an ECDSA
+    signature is a DER SEQUENCE of two INTEGERs, so a careless one-bit flip
+    could merely make the value structurally unacceptable (an INTEGER out of
+    range) rather than produce a proper signature that fails the math. Try
+    bit flips from the signature's last byte backwards and accept the first
+    candidate that is still a parseable signature but raises InvalidSignature
+    under the issuer key -- a genuine, displayable invalid-signature
+    certificate, never a structurally damaged one.
+    """
+    outer = iter_der_elements(original_der)
+    assert len(outer) == 1 and outer[0][0] == 0x30
+    cert_children = iter_der_elements(outer[0][1])
+    assert len(cert_children) == 3
+    assert cert_children[2][0] == 0x03
+    signature_content = bytearray(cert_children[2][1])
+    assert signature_content[0] == 0  # zero unused bits
+    prefix = b"".join(der_tlv(tag, content) for tag, content in cert_children[:2])
+    for position in range(len(signature_content) - 1, 0, -1):
+        for mask in (0x01, 0x02, 0x80):
+            candidate_content = bytearray(signature_content)
+            candidate_content[position] ^= mask
+            candidate_der = der_tlv(
+                0x30, prefix + der_tlv(0x03, bytes(candidate_content))
+            )
+            candidate = x509.load_der_x509_certificate(candidate_der)
+            assert candidate.tbs_certificate_bytes == tbs_bytes
+            try:
+                issuer_public_key.verify(
+                    candidate.signature,
+                    candidate.tbs_certificate_bytes,
+                    ec.ECDSA(hashes.SHA256()),
+                )
+            except InvalidSignature:
+                return candidate_der
+            except ValueError:
+                # The flip merely deformed the DER-encoded ECDSA value
+                # (bad INTEGER encoding); keep searching for a candidate
+                # that is structurally valid but mathematically wrong.
+                continue
+    raise AssertionError(
+        "no bit flip produced a well-formed but invalid ECDSA signature"
+    )
 
 
 # --- DER surgery for DirectoryString name-value encodings ----------------
@@ -682,6 +731,125 @@ def write_name_string_encoding_fixtures():
         )
 
 
+def write_ec_fixtures():
+    """PEM fixtures pinning information display for an EC certificate.
+
+    The committed RSA samples cannot prove that inspect shows the same
+    complete output for a certificate whose subject public key is an EC
+    point rather than an RSA modulus:
+
+      ec
+          A complete certificate carrying a P-256 (prime256v1) subject
+          public key, signed by a SEPARATE P-256 key with ECDSA and SHA-256
+          (ecdsa-with-SHA256, OID 1.2.840.10045.4.3.2). Subject and issuer
+          are deliberately different names; the names and the fixed
+          validity window are constants. Its signature is a real signature
+          that verifies under the issuer key.
+      ec_badsign
+          The same certificate with a well-formed but wrong ECDSA
+          signatureValue (tbsCertificate byte-identical). It is still a
+          complete X.509 certificate and must display exactly like ec.pem,
+          with its own SHA-256 fingerprint; verification genuinely fails.
+      ec_issuer_public.pem
+          The issuer key's SubjectPublicKeyInfo (not a certificate). The
+          offline regression proof of the signature state needs the issuer
+          public key independently of the leaf certificate -- the issuer
+          name is not the subject name and no chain is bundled. Like the
+          RSA key-only samples it is copied verbatim and never decoded by
+          prepare_fixtures.sh.
+
+    The verification outcomes (original verifies, tampered fails) are
+    asserted here with real ECDSA cryptography, so the invalid signature is
+    a genuine property of the fixture input rather than a stand-in such as
+    expiry or matching names.
+    """
+    import datetime
+
+    utc = datetime.timezone.utc
+
+    ec_subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Trustpeek EC Test Org"),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Engineering"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "ec-leaf.example.test"),
+        ]
+    )
+    ec_issuer = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Trustpeek EC Test Org"),
+            x509.NameAttribute(
+                NameOID.ORGANIZATIONAL_UNIT_NAME, "Certificate Authority"
+            ),
+            x509.NameAttribute(NameOID.COMMON_NAME, "ec-issuer.example.test"),
+        ]
+    )
+    issuer_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    ec_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ec_subject)
+        .issuer_name(ec_issuer)
+        .public_key(leaf_key.public_key())
+        .serial_number(0x7001)
+        .not_valid_before(datetime.datetime(2025, 1, 1, tzinfo=utc))
+        .not_valid_after(datetime.datetime(2035, 1, 1, tzinfo=utc))
+        # An EC signing key plus SHA-256 selects ecdsa-with-SHA256; recent
+        # cryptography releases accept the hash algorithm itself here
+        # rather than an ec.ECDSA(...) wrapper.
+        .sign(issuer_key, hashes.SHA256())
+    )
+    ec_der = ec_cert.public_bytes(serialization.Encoding.DER)
+
+    # Fixed structural preconditions the regression relies on: an EC key on
+    # both sides, ECDSA-with-SHA256, distinct names and distinct key pairs.
+    assert isinstance(ec_cert.public_key(), ec.EllipticCurvePublicKey)
+    assert isinstance(ec_cert.public_key().curve, ec.SECP256R1)
+    assert isinstance(issuer_key.public_key(), ec.EllipticCurvePublicKey)
+    assert isinstance(issuer_key.public_key().curve, ec.SECP256R1)
+    assert ec_cert.signature_algorithm_oid == SignatureAlgorithmOID.ECDSA_WITH_SHA256
+    assert ec_cert.subject != ec_cert.issuer
+    issuer_numbers = issuer_key.public_key().public_numbers()
+    leaf_numbers = leaf_key.public_key().public_numbers()
+    assert (issuer_numbers.x, issuer_numbers.y) != (leaf_numbers.x, leaf_numbers.y)
+    issuer_key.public_key().verify(
+        ec_cert.signature,
+        ec_cert.tbs_certificate_bytes,
+        ec.ECDSA(hashes.SHA256()),
+    )
+
+    ec_badsign_der = tamper_ecdsa_signature(
+        ec_der, issuer_key.public_key(), ec_cert.tbs_certificate_bytes
+    )
+    ec_badsign_cert = x509.load_der_x509_certificate(ec_badsign_der)
+    assert ec_badsign_cert.tbs_certificate_bytes == ec_cert.tbs_certificate_bytes
+    assert ec_badsign_cert.signature != ec_cert.signature
+    assert (
+        ec_badsign_cert.public_key().public_numbers()
+        == ec_cert.public_key().public_numbers()
+    )
+    try:
+        issuer_key.public_key().verify(
+            ec_badsign_cert.signature,
+            ec_badsign_cert.tbs_certificate_bytes,
+            ec.ECDSA(hashes.SHA256()),
+        )
+    except InvalidSignature:
+        pass
+    else:
+        raise AssertionError("tampered EC signature unexpectedly verifies")
+
+    write_cert_pem("ec", ec_der)
+    write_cert_pem("ec_badsign", ec_badsign_der)
+    (FIXTURES / "ec_issuer_public.pem").write_bytes(
+        issuer_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+
 def main():
     import datetime
 
@@ -918,6 +1086,7 @@ def main():
 
     write_ctrlchars_fixtures()
     write_name_string_encoding_fixtures()
+    write_ec_fixtures()
 
     # --- Validity-time fixtures -----------------------------------------
     #

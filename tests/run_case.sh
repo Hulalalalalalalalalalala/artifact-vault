@@ -96,10 +96,20 @@ CENTURY_FINGERPRINT=$(fingerprint_of "$FIXTURES/century.der")
 MIXED_FINGERPRINT=$(fingerprint_of "$FIXTURES/mixedyears.der")
 GENERALIZED_FINGERPRINT=$(fingerprint_of "$FIXTURES/generalized.der")
 REVERSE_FINGERPRINT=$(fingerprint_of "$FIXTURES/reverseorder.der")
+EC_FINGERPRINT=$(fingerprint_of "$FIXTURES/ec.der")
+EC_BADSIGN_FINGERPRINT=$(fingerprint_of "$FIXTURES/ec_badsign.der")
 
 VALID_SUBJECT='C=CN, O=Trustpeek Test Org, OU=Engineering, CN=valid.example.test'
 EXPIRED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=expired.example.test'
 MARKER_SUBJECT='C=CN, O=Trustpeek Test Org, CN=marker -----BEGIN CERTIFICATE----- and -----END CERTIFICATE----- test'
+
+# Subject and issuer of the P-256/ECDSA certificate (tests/fixtures/ec.*).
+# The subject public key is an EC point on P-256 and the issuer is a
+# DIFFERENT P-256 key, so this is not a self-signed stand-in; inspect prints
+# no key-type-specific field, so the output keeps exactly the same seven
+# lines and field order as every RSA certificate.
+EC_SUBJECT='C=CN, O=Trustpeek EC Test Org, OU=Engineering, CN=ec-leaf.example.test'
+EC_ISSUER='C=CN, O=Trustpeek EC Test Org, OU=Certificate Authority, CN=ec-issuer.example.test'
 
 # Subject and issuer of the deliberately non-self-signed complex-name
 # certificate (tests/fixtures/names.{pem,der}). Every attribute, its order,
@@ -206,6 +216,38 @@ write_expected_badsign() {  # $1 = encoding, $2 = output file
     } >"$2"
 }
 
+# The P-256 leaf certificate (ec.*): EC subject public key, ECDSA-with-SHA256
+# signature from a distinct P-256 issuer key, distinct subject and issuer.
+# inspect is key-type agnostic, so the output has the very same seven fields
+# in the same order as every RSA certificate.
+write_expected_ec() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$EC_SUBJECT"
+        printf 'Issuer: %s\n' "$EC_ISSUER"
+        printf 'Not Before: 2025-01-01T00:00:00Z\n'
+        printf 'Not After: 2035-01-01T00:00:00Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$EC_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+# The tampered-ECDSA certificate (ec_badsign.*) shares every informational
+# field with ec.* -- same subject, issuer, validity, EC public key and
+# signature algorithm; only the signature content (and therefore the
+# fingerprint) differs.
+write_expected_ec_badsign() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$EC_SUBJECT"
+        printf 'Issuer: %s\n' "$EC_ISSUER"
+        printf 'Not Before: 2025-01-01T00:00:00Z\n'
+        printf 'Not After: 2035-01-01T00:00:00Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$EC_BADSIGN_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
 write_expected_marker() {  # $1 = encoding, $2 = output file
     {
         printf 'Encoding: %s\n' "$1"
@@ -302,6 +344,66 @@ write_expected_generalized() {  # $1 = encoding, $2 = output file
 write_expected_reverse() {  # $1 = encoding, $2 = output file
     write_expected_time "$1" "$2" "$REVERSE_SUBJECT" \
         '1949-01-01T00:00:00Z' '1950-06-15T12:00:00Z' "$REVERSE_FINGERPRINT"
+}
+
+# Structural guards for the EC certificate output ($1 = captured stdout
+# file). inspect reads X.509 information without caring about the public key
+# type, so an EC certificate must render with the exact same seven labeled
+# fields in the exact same order as an RSA one: no key-type-specific line is
+# added and no field is dropped. These checks also pin the distinct subject
+# and issuer, the UTC time shape, the uppercase colon-separated fingerprint,
+# and the fact that a verifiable signature never turns into a trust claim.
+assert_ec_structure() {
+    out=$1
+    subject=$(sed -n 's/^Subject: //p' "$out")
+    issuer=$(sed -n 's/^Issuer: //p' "$out")
+
+    [ "$subject" = "$EC_SUBJECT" ] ||
+        fail "EC subject rendered incompletely or reordered"
+    [ "$issuer" = "$EC_ISSUER" ] ||
+        fail "EC issuer rendered incompletely or reordered"
+    [ "$subject" != "$issuer" ] ||
+        fail "the EC certificate must have different subject and issuer"
+    [ "$(grep -c '^Subject: ' "$out")" -eq 1 ] ||
+        fail "Subject must occupy exactly one line"
+    [ "$(grep -c '^Issuer: ' "$out")" -eq 1 ] ||
+        fail "Issuer must occupy exactly one line"
+    [ "$(wc -l <"$out")" -eq 7 ] ||
+        fail "EC output must have exactly 7 lines (an EC key must not add fields)"
+
+    # Field labels must appear in exactly this order -- no extra key-type
+    # line (e.g. a "Public Key" row) and no missing row.
+    set -- 'Encoding: ' 'Subject: ' 'Issuer: ' 'Not Before: ' \
+           'Not After: ' 'SHA-256 Fingerprint: ' 'Note:'
+    line_no=1
+    for prefix in "$@"; do
+        sed -n "${line_no}p" "$out" | grep -qF "$prefix" ||
+            fail "line $line_no must start with '$prefix' for an EC certificate too"
+        line_no=$((line_no + 1))
+    done
+
+    before=$(sed -n 's/^Not Before: //p' "$out")
+    after=$(sed -n 's/^Not After: //p' "$out")
+    bad=$(printf '%s\n%s\n' "$before" "$after" |
+              grep -vcE '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$')
+    [ "$bad" -eq 0 ] ||
+        fail "EC validity times must be full YYYY-MM-DDTHH:MM:SSZ UTC strings"
+
+    fingerprint=$(sed -n 's/^SHA-256 Fingerprint: //p' "$out")
+    printf '%s\n' "$fingerprint" |
+        grep -qE '^([0-9A-F]{2}:){31}[0-9A-F]{2}$' ||
+        fail "EC fingerprint must be 32 uppercase colon-separated hex bytes"
+
+    # A successful read must never claim the signature is valid/trusted.
+    # The Note itself only denies verification, so any trust claim is a
+    # regression even for a certificate whose signature really verifies.
+    if grep -iqE 'trusted|signature (is )?(valid|verified)' "$out"; then
+        fail "EC output must not state or imply that the signature is trusted"
+    fi
+    grep -qF "$NOTE" "$out" ||
+        fail "output must keep the no-trust-verification Note"
+    iconv -f UTF-8 -t UTF-8 "$out" >/dev/null ||
+        fail "output is not valid UTF-8"
 }
 
 # Structural guards for a validity-time output ($1 = captured stdout file,
@@ -1156,6 +1258,371 @@ EOF
         size=$(wc -c <"$FIXTURES/badsign.der")
         head -c $((size / 2)) "$FIXTURES/badsign.der" >"$TMP/truncated.der"
         expect_invalid "$TMP/truncated.der"
+        ;;
+
+    # --- Elliptic-curve (P-256 / ECDSA-SHA256) certificate -----------
+    # ec.* is a complete certificate with a P-256 subject public key,
+    # signed by a DIFFERENT P-256 key with ECDSA and SHA-256; subject and
+    # issuer are different names and the validity window is fixed. inspect
+    # only reads X.509 information: it neither restricts the public key
+    # type nor verifies any signature, so this certificate must display in
+    # PEM and DER with exactly the same fields, order, UTC times, fingerprint
+    # format and closing Note as every RSA sample. ec_badsign.* keeps the
+    # identical tbsCertificate (same subject, issuer, validity, EC public
+    # key and signature algorithm) but carries a well-formed ECDSA signature
+    # that genuinely fails verification; it must still display, with the
+    # fingerprint of its OWN complete DER.
+
+    ec_pem)
+        write_expected_ec PEM "$TMP/expected"
+        expect_success "$FIXTURES/ec.pem" "$TMP/expected"
+        assert_ec_structure "$TMP/expected"
+        ;;
+
+    ec_der)
+        write_expected_ec DER "$TMP/expected"
+        expect_success "$FIXTURES/ec.der" "$TMP/expected"
+        assert_ec_structure "$TMP/expected"
+        ;;
+
+    ec_pem_der_same_fields)
+        # The same EC certificate saved as PEM and as DER: the Encoding line
+        # reports the real format, everything else agrees verbatim.
+        "$BIN" inspect "$FIXTURES/ec.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/ec.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree outside the Encoding line"
+        assert_ec_structure "$TMP/der.out"
+        # Guard against weakening the fixture into a self-signed cert.
+        pem_subject=$(sed -n 's/^Subject: //p' "$TMP/pem.out")
+        pem_issuer=$(sed -n 's/^Issuer: //p' "$TMP/pem.out")
+        [ "$pem_subject" != "$pem_issuer" ] ||
+            fail "ec fixture must have different subject and issuer"
+        ;;
+
+    ec_badsign_pem)
+        write_expected_ec_badsign PEM "$TMP/expected"
+        expect_success "$FIXTURES/ec_badsign.pem" "$TMP/expected"
+        assert_ec_structure "$TMP/expected"
+        ;;
+
+    ec_der_badsign)
+        write_expected_ec_badsign DER "$TMP/expected"
+        expect_success "$FIXTURES/ec_badsign.der" "$TMP/expected"
+        assert_ec_structure "$TMP/expected"
+        ;;
+
+    ec_badsign_pem_der_same_fields)
+        # The invalid-ECDSA certificate saved as PEM and as DER: the Encoding
+        # line reports the real format, everything else (including the
+        # fingerprint of the tampered bytes) agrees.
+        "$BIN" inspect "$FIXTURES/ec_badsign.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/ec_badsign.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree outside the Encoding line"
+        assert_ec_structure "$TMP/der.out"
+        ;;
+
+    ec_badsign_same_fields_as_ec)
+        # The two EC certificates share subject, issuer, validity, public key
+        # and signature algorithm: those rendered lines must be identical,
+        # while the SHA-256 fingerprints differ because the signature is part
+        # of the certificate bytes each fingerprint is computed over. The
+        # tampered certificate must not reuse the original's fingerprint.
+        "$BIN" inspect "$FIXTURES/ec.pem" >"$TMP/ec.out" 2>"$TMP/ec.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "ec.pem inspect failed with $rc"
+        [ -s "$TMP/ec.err" ] &&
+            fail "ec.pem stderr not empty: $(cat "$TMP/ec.err")"
+        "$BIN" inspect "$FIXTURES/ec_badsign.pem" >"$TMP/badsign.out" 2>"$TMP/badsign.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "ec_badsign.pem inspect failed with $rc"
+        [ -s "$TMP/badsign.err" ] &&
+            fail "ec_badsign.pem stderr not empty: $(cat "$TMP/badsign.err")"
+        sed -n '2,5p' "$TMP/ec.out" >"$TMP/ec.fields"
+        sed -n '2,5p' "$TMP/badsign.out" >"$TMP/badsign.fields"
+        cmp -s "$TMP/ec.fields" "$TMP/badsign.fields" ||
+            fail "subject/issuer/validity lines must be identical for the two EC certificates"
+        grep -qx "SHA-256 Fingerprint: $EC_FINGERPRINT" "$TMP/ec.out" ||
+            fail "ec.pem must show the fingerprint of its own complete DER encoding"
+        grep -qx "SHA-256 Fingerprint: $EC_BADSIGN_FINGERPRINT" "$TMP/badsign.out" ||
+            fail "ec_badsign.pem must show the fingerprint of its own complete DER encoding"
+        [ "$EC_FINGERPRINT" != "$EC_BADSIGN_FINGERPRINT" ] ||
+            fail "the two EC certificates must have different SHA-256 fingerprints"
+        grep -q "$EC_FINGERPRINT" "$TMP/badsign.out" &&
+            fail "the tampered EC certificate must not reuse the original's fingerprint"
+        grep -qF "$NOTE" "$TMP/ec.out" ||
+            fail "ec.pem output must keep the no-trust-verification Note"
+        grep -qF "$NOTE" "$TMP/badsign.out" ||
+            fail "ec_badsign.pem output must keep the no-trust-verification Note"
+        assert_ec_structure "$TMP/ec.out"
+        assert_ec_structure "$TMP/badsign.out"
+        ;;
+
+    ec_signature_really_invalid)
+        # The two signature states must be genuine cryptographic properties
+        # of the fixture inputs -- not self-signedness, matching names or
+        # expiry. Prove offline, with the Python standard library only (no
+        # cryptography package, no network, no system trust store, no
+        # dependence on the current date), that:
+        #   * both certificates carry the SAME tbsCertificate bytes (same
+        #     subject, issuer, validity, EC public key, signature algorithm)
+        #     and differ only in the signatureValue;
+        #   * both subject and issuer keys are P-256 EC keys (id-ecPublicKey
+        #     + prime256v1), and they are DIFFERENT keys;
+        #   * both signatures are well-formed canonical ECDSA values
+        #     (SEQUENCE of two in-range INTEGERs);
+        #   * ec.der's ECDSA signature verifies under the issuer key;
+        #   * ec_badsign.der's signature does NOT verify under that key.
+        if ! python3 - "$FIXTURES/ec.der" "$FIXTURES/ec_badsign.der" "$FIXTURES/ec_issuer_public.pem" <<'EOF'
+import base64
+import hashlib
+import sys
+
+
+def fail(message):
+    print(f"fixture precondition failed: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def read_tlv(data, pos):
+    start = pos
+    tag = data[pos]
+    pos += 1
+    first = data[pos]
+    pos += 1
+    if first < 0x80:
+        length = first
+    else:
+        count = first & 0x7F
+        length = int.from_bytes(data[pos:pos + count], "big")
+        pos += count
+    end = pos + length
+    return tag, data[pos:end], data[start:end], end
+
+
+def parse_children(content):
+    children = []
+    pos = 0
+    while pos < len(content):
+        child = read_tlv(content, pos)
+        children.append(child)
+        pos = child[3]
+    if pos != len(content):
+        fail("a DER structure must end exactly at its declared length")
+    return children
+
+
+def parse_cert(path):
+    with open(path, "rb") as handle:
+        der = handle.read()
+    tag, content, _, end = read_tlv(der, 0)
+    if tag != 0x30 or end != len(der):
+        fail(f"{path}: outer SEQUENCE must span the whole file")
+    children = parse_children(content)
+    if len(children) != 3:
+        fail(f"{path}: a certificate must have exactly 3 top-level elements")
+    return children, content
+
+
+def read_pem_der(path):
+    lines = []
+    with open(path, "rb") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith(b"-----"):
+                continue
+            lines.append(line)
+    return base64.b64decode(b"".join(lines))
+
+
+# --- P-256 domain parameters (FIPS 186-4 / SEC 2) -------------------------
+P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+A = P - 3
+GX = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
+GY = 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5
+N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+G = (GX, GY)
+
+
+def point_add(point1, point2):
+    if point1 is None:
+        return point2
+    if point2 is None:
+        return point1
+    x1, y1 = point1
+    x2, y2 = point2
+    if x1 == x2 and (y1 + y2) % P == 0:
+        return None
+    if point1 == point2:
+        slope = (3 * x1 * x1 + A) * pow(2 * y1, P - 2, P) % P
+    else:
+        slope = (y2 - y1) * pow(x2 - x1, P - 2, P) % P
+    x3 = (slope * slope - x1 - x2) % P
+    y3 = (slope * (x1 - x3) - y1) % P
+    return x3, y3
+
+
+def scalar_mult(point, scalar):
+    result = None
+    addend = point
+    while scalar:
+        if scalar & 1:
+            result = point_add(result, addend)
+        addend = point_add(addend, addend)
+        scalar >>= 1
+    return result
+
+
+def ecdsa_p256_verifies(point, tbs, signature_bytes):
+    # ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
+    tag, seq_content, _, end = read_tlv(signature_bytes, 0)
+    if tag != 0x30 or end != len(signature_bytes):
+        fail("signature must be one DER SEQUENCE spanning all its bytes")
+    integers = parse_children(seq_content)
+    if len(integers) != 2 or integers[0][0] != 0x02 or integers[1][0] != 0x02:
+        fail("ECDSA signature must contain exactly two INTEGERs r and s")
+    values = []
+    for _, raw, tlv, _ in integers:
+        if not raw:
+            fail("ECDSA INTEGER must not be empty")
+        # DER minimal encoding: a positive INTEGER whose high bit is set
+        # needs exactly one leading 0x00 sign byte; any other leading zero
+        # is non-minimal.
+        if len(raw) > 1 and raw[0] == 0 and not (raw[1] & 0x80):
+            fail("ECDSA INTEGER must be minimally encoded")
+        value = int.from_bytes(raw, "big")
+        if not 1 <= value < N:
+            fail("ECDSA r and s must be in the range [1, n-1]")
+        values.append(value)
+    r, s = values
+    z = int.from_bytes(hashlib.sha256(tbs).digest(), "big")
+    w = pow(s, N - 2, N)
+    u1 = z * w % N
+    u2 = r * w % N
+    point1 = scalar_mult(G, u1)
+    point2 = scalar_mult(point, u2)
+    x_y = point_add(point1, point2)
+    if x_y is None:
+        return False
+    return x_y[0] % N == r
+
+
+def parse_spki_point(spki_der, where):
+    tag, content, _, end = read_tlv(spki_der, 0)
+    if tag != 0x30 or end != len(spki_der):
+        fail(f"{where}: SubjectPublicKeyInfo must be one whole SEQUENCE")
+    children = parse_children(content)
+    if len(children) != 2 or children[1][0] != 0x03:
+        fail(f"{where}: unexpected SubjectPublicKeyInfo layout")
+    # AlgorithmIdentifier for an EC P-256 key is exactly
+    # SEQUENCE { OID id-ecPublicKey (1.2.840.10045.2.1),
+    #            OID prime256v1  (1.2.840.10045.3.1.7) }.
+    EC_ALGORITHM = bytes.fromhex("301306072a8648ce3d020106082a8648ce3d030107")
+    if children[0][2] != EC_ALGORITHM:
+        fail(f"{where}: key must be id-ecPublicKey with prime256v1 (P-256)")
+    bit_content = children[1][1]
+    if bit_content[0] != 0 or len(bit_content) != 66 or bit_content[1] != 0x04:
+        fail(f"{where}: EC point must be a 65-byte uncompressed point")
+    x = int.from_bytes(bit_content[2:34], "big")
+    y = int.from_bytes(bit_content[34:66], "big")
+    if not (0 < x < P and 0 < y < P):
+        fail(f"{where}: EC point coordinates out of range")
+    return x, y, bit_content[1:]
+
+
+ec_children, ec_outer = parse_cert(sys.argv[1])
+bad_children, bad_outer = parse_cert(sys.argv[2])
+
+# tbsCertificate (index 0) and signatureAlgorithm (index 1) must be
+# byte-identical; only the signatureValue BIT STRING (index 2) may differ.
+if ec_children[0][2] != bad_children[0][2]:
+    fail("the two EC certificates must share the same tbsCertificate bytes")
+if ec_children[1][2] != bad_children[1][2]:
+    fail("the two EC certificates must use the same signature algorithm")
+if ec_children[2][1] == bad_children[2][1]:
+    fail("the signature content must differ between the two EC certificates")
+
+# ecdsa-with-SHA256 (1.2.840.10045.4.3.2) is the declared algorithm.
+ECDSA_SHA256_OID = bytes.fromhex("06082a8648ce3d040302")
+if ECDSA_SHA256_OID not in ec_children[1][1]:
+    fail("EC fixtures must be signed with ecdsa-with-SHA256")
+
+# SubjectPublicKeyInfo is the seventh tbsCertificate element.
+tbs_children = parse_children(ec_children[0][1])
+if tbs_children[0][0] != 0xA0 or len(tbs_children) < 7:
+    fail("unexpected tbsCertificate layout")
+leaf_der = tbs_children[6][2]
+leaf_x, leaf_y, leaf_point = parse_spki_point(leaf_der, sys.argv[1])
+
+# The issuer public key comes from its own committed SPKI sample (the names
+# differ, so nothing in the leaf certificate could supply the issuer key).
+issuer_der = read_pem_der(sys.argv[3])
+issuer_x, issuer_y, issuer_point = parse_spki_point(issuer_der, sys.argv[3])
+if issuer_point == leaf_point:
+    fail("the leaf must be signed by a DIFFERENT EC key, not its own key")
+
+tbs_tlv = ec_children[0][2]
+if not ecdsa_p256_verifies((issuer_x, issuer_y), tbs_tlv,
+                           ec_children[2][1][1:]):
+    fail("the original EC certificate's signature must verify")
+if ecdsa_p256_verifies((issuer_x, issuer_y), tbs_tlv,
+                       bad_children[2][1][1:]):
+    fail("the tampered EC certificate's signature must NOT verify")
+EOF
+        then
+            fail "the ec_badsign fixture's invalid signature is not a genuine input property"
+        fi
+        ;;
+
+    ec_badsign_der_truncated)
+        # Signature-invalid vs format-corrupt must stay distinct for EC too:
+        # a truncated EC certificate (here the already-signature-invalid one)
+        # is no longer a complete X.509 object -- exit 1, empty stdout,
+        # invalid-certificate diagnostic naming the path, never displayed as
+        # an "invalid signature" certificate.
+        size=$(wc -c <"$FIXTURES/ec_badsign.der")
+        head -c $((size / 2)) "$FIXTURES/ec_badsign.der" >"$TMP/truncated.der"
+        expect_invalid "$TMP/truncated.der"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "a truncated EC certificate is bad content, not a read failure"
+        ;;
+
+    ec_badsign_pem_truncated)
+        # Same boundary in PEM: cutting the one CERTIFICATE block short leaves
+        # no complete certificate, so it must be a content error rather than a
+        # displayable signature-invalid EC certificate.
+        size=$(wc -c <"$FIXTURES/ec_badsign.pem")
+        # Keep the BEGIN marker and part of the body but drop the end of the
+        # base64 body and the END marker: no complete block can decode.
+        head -c $((size / 2)) "$FIXTURES/ec_badsign.pem" >"$TMP/truncated.pem"
+        expect_invalid "$TMP/truncated.pem"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "a truncated EC PEM is bad content, not a read failure"
         ;;
 
     der_marker_in_name)
