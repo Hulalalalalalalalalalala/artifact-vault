@@ -82,6 +82,13 @@ if(BUILD_TESTING)
         ec_signature_really_invalid
         ec_badsign_der_truncated
         ec_badsign_pem_truncated
+        ec_badstructure_pem
+        ec_badstructure_der
+        ec_badstructure_pem_der_same_fields
+        ec_badstructure_same_fields_as_ec
+        ec_badstructure_signature_not_ecdsa
+        ec_badstructure_der_truncated
+        ec_badstructure_pem_truncated
         der_marker_in_name
         pem_marker_in_name
         der_complex_names

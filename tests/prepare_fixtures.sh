@@ -76,6 +76,7 @@ reverseorder
 baddate
 ec
 ec_badsign
+ec_badstructure
 '
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/trustpeek-fixtures.XXXXXX") || {
