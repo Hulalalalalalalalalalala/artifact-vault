@@ -242,6 +242,69 @@ def tamper_ecdsa_signature(original_der, issuer_public_key, tbs_bytes):
     )
 
 
+def corrupt_ecdsa_signature_inner(original_der):
+    """Return a complete EC certificate whose signature VALUE cannot be
+    interpreted as a legal ECDSA signature: one of the two INTEGERs an
+    ECDSA-Sig-Value requires is missing INSIDE the signature.
+
+    Only the bytes inside the signatureValue BIT STRING change. The BIT
+    STRING itself stays a complete, readable TLV (correct tag and length,
+    zero unused bits, carrying one complete DER SEQUENCE), the surrounding
+    X.509 Certificate stays whole and ends exactly at its declared length
+    (nothing is truncated and no byte trails the file), and the
+    tbsCertificate (subject, issuer, validity, P-256 public key and the
+    ecdsa-with-SHA256 signature algorithm) stays byte-for-byte identical.
+
+    The inner SEQUENCE deliberately holds just the first INTEGER (r) and
+    omits the second (s): it is structurally NOT an ECDSA-Sig-Value
+    (SEQUENCE of TWO INTEGERs) while every container around it is intact.
+    This pins the boundary next to tamper_ecdsa_signature(): a signature
+    that is wrong-but-legal ECDSA and one that is not a legal ECDSA value
+    at all are BOTH displayed, because inspect never verifies signatures;
+    only truncating the certificate so the BIT STRING runs past the actual
+    content is certificate format damage.
+    """
+    outer = iter_der_elements(original_der)
+    assert len(outer) == 1 and outer[0][0] == 0x30
+    cert_children = iter_der_elements(outer[0][1])
+    assert len(cert_children) == 3
+    assert cert_children[2][0] == 0x03  # signatureValue BIT STRING
+    signature_content = bytearray(cert_children[2][1])
+    assert signature_content[0] == 0  # zero unused bits
+
+    # The legal value is one SEQUENCE spanning the whole BIT STRING payload
+    # and containing exactly two INTEGERs (r, s); iter_der_elements() also
+    # asserts the SEQUENCE reaches the end of the buffer it is given.
+    inner = iter_der_elements(bytes(signature_content[1:]))
+    assert len(inner) == 1 and inner[0][0] == 0x30
+    integers = iter_der_elements(inner[0][1])
+    assert len(integers) == 2
+    assert integers[0][0] == 0x02 and integers[1][0] == 0x02
+    r_tlv = der_tlv(0x02, integers[0][1])
+
+    # Rebuild the inner SEQUENCE with ONLY r: the second INTEGER that
+    # ECDSA requires is absent. The BIT STRING remains complete, and the
+    # certificate wrapper is rebuilt from the untouched tbsCertificate and
+    # signatureAlgorithm, so the outer X.509 object is fully parseable.
+    broken_inner = der_tlv(0x30, r_tlv)
+    broken_signature_content = b"\x00" + broken_inner
+    prefix = b"".join(der_tlv(tag, content) for tag, content in cert_children[:2])
+    corrupted = der_tlv(
+        0x30, prefix + der_tlv(0x03, broken_signature_content)
+    )
+
+    # The result must still be exactly one whole outer SEQUENCE with three
+    # top-level elements (tbsCertificate, signatureAlgorithm, BIT STRING):
+    # a readable certificate whose only defect lives inside the signature.
+    rebuilt_outer = iter_der_elements(corrupted)
+    assert len(rebuilt_outer) == 1 and rebuilt_outer[0][0] == 0x30
+    rebuilt_children = iter_der_elements(rebuilt_outer[0][1])
+    assert len(rebuilt_children) == 3
+    assert rebuilt_children[2][0] == 0x03
+    assert rebuilt_children[2][1] == broken_signature_content
+    return corrupted
+
+
 # --- DER surgery for DirectoryString name-value encodings ----------------
 #
 # The certificate builder only emits UTF8String (tag 0x0C) name values. X.509
@@ -750,6 +813,20 @@ def write_ec_fixtures():
           signatureValue (tbsCertificate byte-identical). It is still a
           complete X.509 certificate and must display exactly like ec.pem,
           with its own SHA-256 fingerprint; verification genuinely fails.
+      ec_badsign_inner
+          The same certificate with a signatureValue that is no longer a
+          legal ECDSA value at all: the DER SEQUENCE inside the complete
+          signatureValue BIT STRING carries only the first of the two
+          required INTEGERs (the second is missing). The BIT STRING and
+          the whole X.509 wrapper stay complete (nothing is truncated, no
+          byte trails the file) and the tbsCertificate is byte-identical;
+          only the signature CONTENT is uninterpretable as ECDSA. Like
+          ec_badsign it must display exactly like ec.pem with its own
+          fingerprint -- an un-verifiable signature is not format damage.
+          The adjacent rejection is truncating the outer certificate so
+          the BIT STRING's declared length overruns the file, which IS
+          format damage (a separate test crafts that by truncation; this
+          sample itself is a complete object).
       ec_issuer_public.pem
           The issuer key's SubjectPublicKeyInfo (not a certificate). The
           offline regression proof of the signature state needs the issuer
@@ -840,8 +917,38 @@ def write_ec_fixtures():
     else:
         raise AssertionError("tampered EC signature unexpectedly verifies")
 
+    # Adjacent boundary INSIDE the signature: the signatureValue can no
+    # longer be interpreted as a legal ECDSA value because one of the two
+    # required INTEGERs is absent, yet the signatureValue BIT STRING and
+    # the whole X.509 wrapper stay complete and readable (nothing is cut,
+    # nothing trails the file). inspect never verifies signatures, so this
+    # certificate must display exactly like ec.pem with its own fingerprint
+    # rather than be reported as a format error; only truncating the outer
+    # layer so the BIT STRING overruns the file is certificate format
+    # damage. The structural assertions below pin the genuine input
+    # condition (a one-INTEGER inner SEQUENCE is not an ECDSA-Sig-Value).
+    ec_inner_badsign_der = corrupt_ecdsa_signature_inner(ec_der)
+    ec_inner_badsign_cert = x509.load_der_x509_certificate(ec_inner_badsign_der)
+    assert ec_inner_badsign_cert.tbs_certificate_bytes == ec_cert.tbs_certificate_bytes
+    assert (
+        ec_inner_badsign_cert.public_key().public_numbers()
+        == ec_cert.public_key().public_numbers()
+    )
+    inner_outer = iter_der_elements(ec_inner_badsign_der)
+    inner_cert_children = iter_der_elements(inner_outer[0][1])
+    assert len(inner_cert_children) == 3
+    inner_sig_content = inner_cert_children[2][1]
+    assert inner_sig_content[0] == 0  # the BIT STRING itself is well formed
+    inner_seq = iter_der_elements(inner_sig_content[1:])
+    assert len(inner_seq) == 1 and inner_seq[0][0] == 0x30
+    inner_integers = iter_der_elements(inner_seq[0][1])
+    assert len(inner_integers) == 1 and inner_integers[0][0] == 0x02
+    # It differs from the original legal signature content.
+    assert inner_sig_content[1:] != ec_cert.signature
+
     write_cert_pem("ec", ec_der)
     write_cert_pem("ec_badsign", ec_badsign_der)
+    write_cert_pem("ec_badsign_inner", ec_inner_badsign_der)
     (FIXTURES / "ec_issuer_public.pem").write_bytes(
         issuer_key.public_key().public_bytes(
             serialization.Encoding.PEM,

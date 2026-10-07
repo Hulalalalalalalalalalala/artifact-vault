@@ -98,6 +98,7 @@ GENERALIZED_FINGERPRINT=$(fingerprint_of "$FIXTURES/generalized.der")
 REVERSE_FINGERPRINT=$(fingerprint_of "$FIXTURES/reverseorder.der")
 EC_FINGERPRINT=$(fingerprint_of "$FIXTURES/ec.der")
 EC_BADSIGN_FINGERPRINT=$(fingerprint_of "$FIXTURES/ec_badsign.der")
+EC_BADSIGN_INNER_FINGERPRINT=$(fingerprint_of "$FIXTURES/ec_badsign_inner.der")
 
 VALID_SUBJECT='C=CN, O=Trustpeek Test Org, OU=Engineering, CN=valid.example.test'
 EXPIRED_SUBJECT='C=CN, O=Trustpeek Test Org, CN=expired.example.test'
@@ -244,6 +245,24 @@ write_expected_ec_badsign() {  # $1 = encoding, $2 = output file
         printf 'Not Before: 2025-01-01T00:00:00Z\n'
         printf 'Not After: 2035-01-01T00:00:00Z\n'
         printf 'SHA-256 Fingerprint: %s\n' "$EC_BADSIGN_FINGERPRINT"
+        printf '%s\n' "$NOTE"
+    } >"$2"
+}
+
+# The structurally-uninterpretable-signature certificate
+# (ec_badsign_inner.*) likewise shares every informational field with ec.*;
+# its signatureValue BIT STRING and the whole X.509 wrapper are complete,
+# but the DER SEQUENCE inside that BIT STRING is missing one of the two
+# INTEGERs ECDSA requires. inspect does not verify or even decode the
+# signature, so it displays identically apart from its own fingerprint.
+write_expected_ec_badsign_inner() {  # $1 = encoding, $2 = output file
+    {
+        printf 'Encoding: %s\n' "$1"
+        printf 'Subject: %s\n' "$EC_SUBJECT"
+        printf 'Issuer: %s\n' "$EC_ISSUER"
+        printf 'Not Before: 2025-01-01T00:00:00Z\n'
+        printf 'Not After: 2035-01-01T00:00:00Z\n'
+        printf 'SHA-256 Fingerprint: %s\n' "$EC_BADSIGN_INNER_FINGERPRINT"
         printf '%s\n' "$NOTE"
     } >"$2"
 }
@@ -1623,6 +1642,482 @@ EOF
         expect_invalid "$TMP/truncated.pem"
         grep -q "failed to read file" "$TMP/stderr" &&
             fail "a truncated EC PEM is bad content, not a read failure"
+        ;;
+
+    # --- ECDSA signature whose CONTENT is not a legal ECDSA value ----
+    # ec_badsign_inner.* is the adjacent boundary to ec_badsign.*: the
+    # signature still fails to verify, but here the DER SEQUENCE inside the
+    # signatureValue BIT STRING can no longer be INTERPRETED as an ECDSA
+    # signature at all (one of the two required INTEGERs is missing). The BIT
+    # STRING carrying the value and the whole X.509 wrapper stay complete and
+    # readable -- nothing is cut and no byte trails the file -- and the
+    # tbsCertificate is byte-identical to ec.*. inspect never verifies or
+    # even decodes the signature, so the fixed information view must display
+    # this certificate exactly like the normal one (subject, issuer and both
+    # UTC times verbatim) with the no-trust Note and exit 0. Only its own
+    # fingerprint differs. Truncating the OUTER layer so the signature BIT
+    # STRING overruns the file is a different outcome -- format damage -- and
+    # is pinned by the two *_truncated cases below.
+
+    ec_badsign_inner_pem)
+        write_expected_ec_badsign_inner PEM "$TMP/expected"
+        expect_success "$FIXTURES/ec_badsign_inner.pem" "$TMP/expected"
+        assert_ec_structure "$TMP/expected"
+        ;;
+
+    ec_badsign_inner_der)
+        write_expected_ec_badsign_inner DER "$TMP/expected"
+        expect_success "$FIXTURES/ec_badsign_inner.der" "$TMP/expected"
+        assert_ec_structure "$TMP/expected"
+        ;;
+
+    ec_badsign_inner_pem_der_same_fields)
+        # The same corrupted-signature certificate saved as PEM and as DER:
+        # the Encoding line reports the real format and everything else,
+        # including the fingerprint of these exact complete DER bytes, agrees.
+        "$BIN" inspect "$FIXTURES/ec_badsign_inner.pem" >"$TMP/pem.out" 2>"$TMP/pem.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "PEM input failed with $rc"
+        [ -s "$TMP/pem.err" ] && fail "PEM stderr not empty: $(cat "$TMP/pem.err")"
+        "$BIN" inspect "$FIXTURES/ec_badsign_inner.der" >"$TMP/der.out" 2>"$TMP/der.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "DER input failed with $rc"
+        [ -s "$TMP/der.err" ] && fail "DER stderr not empty: $(cat "$TMP/der.err")"
+        head -n 1 "$TMP/pem.out" | grep -qx 'Encoding: PEM' ||
+            fail "PEM input not reported as PEM"
+        head -n 1 "$TMP/der.out" | grep -qx 'Encoding: DER' ||
+            fail "DER input not reported as DER"
+        tail -n +2 "$TMP/pem.out" >"$TMP/pem.fields"
+        tail -n +2 "$TMP/der.out" >"$TMP/der.fields"
+        cmp -s "$TMP/pem.fields" "$TMP/der.fields" ||
+            fail "PEM and DER runs disagree outside the Encoding line"
+        assert_ec_structure "$TMP/der.out"
+        ;;
+
+    ec_badsign_inner_same_fields_as_ec)
+        # The corrupted-signature certificate and the normal certificate
+        # share subject, issuer, validity, EC public key and signature
+        # algorithm: those four rendered lines must be verbatim identical,
+        # while the fingerprints differ because the signature is part of the
+        # certificate bytes. The corrupted cert must show its OWN complete
+        # DER fingerprint and never reuse the normal certificate's.
+        "$BIN" inspect "$FIXTURES/ec.pem" >"$TMP/ec.out" 2>"$TMP/ec.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "ec.pem inspect failed with $rc"
+        [ -s "$TMP/ec.err" ] && fail "ec.pem stderr not empty: $(cat "$TMP/ec.err")"
+        "$BIN" inspect "$FIXTURES/ec_badsign_inner.pem" >"$TMP/inner.out" 2>"$TMP/inner.err"
+        rc=$?
+        [ "$rc" -eq 0 ] || fail "ec_badsign_inner.pem inspect failed with $rc"
+        [ -s "$TMP/inner.err" ] &&
+            fail "ec_badsign_inner.pem stderr not empty: $(cat "$TMP/inner.err")"
+        sed -n '2,5p' "$TMP/ec.out" >"$TMP/ec.fields"
+        sed -n '2,5p' "$TMP/inner.out" >"$TMP/inner.fields"
+        cmp -s "$TMP/ec.fields" "$TMP/inner.fields" ||
+            fail "subject/issuer/validity lines must be identical to the normal certificate"
+        grep -qx "SHA-256 Fingerprint: $EC_FINGERPRINT" "$TMP/ec.out" ||
+            fail "ec.pem must show the fingerprint of its own complete DER encoding"
+        grep -qx "SHA-256 Fingerprint: $EC_BADSIGN_INNER_FINGERPRINT" "$TMP/inner.out" ||
+            fail "ec_badsign_inner.pem must show the fingerprint of its own complete DER encoding"
+        [ "$EC_FINGERPRINT" != "$EC_BADSIGN_INNER_FINGERPRINT" ] ||
+            fail "the corrupted and normal EC certificates must have different fingerprints"
+        grep -q "$EC_FINGERPRINT" "$TMP/inner.out" &&
+            fail "the corrupted certificate must not reuse the normal certificate's fingerprint"
+        grep -qF "$NOTE" "$TMP/ec.out" ||
+            fail "ec.pem output must keep the no-trust-verification Note"
+        grep -qF "$NOTE" "$TMP/inner.out" ||
+            fail "ec_badsign_inner.pem output must keep the no-trust-verification Note"
+        assert_ec_structure "$TMP/ec.out"
+        assert_ec_structure "$TMP/inner.out"
+        ;;
+
+    ec_inner_signature_not_ecdsa)
+        # The corrupted signature must be a genuine property of the fixture
+        # input, not a stand-in (truncation, un-decodable PEM, self-signedness
+        # or expiry). Prove offline, with the Python standard library only
+        # (no cryptography package, no network, no system trust store, no
+        # dependence on the current date), that:
+        #   * ec_badsign_inner is a COMPLETE certificate: its outer SEQUENCE
+        #     spans the whole file (nothing truncated, nothing trailing) and
+        #     the signatureValue BIT STRING is itself complete, ends exactly at
+        #     EOF and has zero unused bits;
+        #   * it shares the byte-identical tbsCertificate and signature
+        #     algorithm with the normal ec certificate (only the signature
+        #     content differs);
+        #   * the DER SEQUENCE inside that complete BIT STRING contains
+        #     exactly ONE INTEGER: an ECDSA-Sig-Value is a SEQUENCE of TWO
+        #     INTEGERs, so this value cannot be interpreted as ECDSA at all;
+        #   * the normal ec signature is a legal two-INTEGER value that really
+        #     verifies under the independent P-256 issuer key.
+        if ! python3 - "$FIXTURES/ec.der" "$FIXTURES/ec_badsign_inner.der" "$FIXTURES/ec_issuer_public.pem" <<'EOF'
+import base64
+import hashlib
+import sys
+
+
+def fail(message):
+    print(f"fixture precondition failed: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def read_tlv(data, pos):
+    start = pos
+    tag = data[pos]
+    pos += 1
+    first = data[pos]
+    pos += 1
+    if first < 0x80:
+        length = first
+    else:
+        count = first & 0x7F
+        if pos + count > len(data):
+            fail("a TLV length is truncated")
+        length = int.from_bytes(data[pos:pos + count], "big")
+        pos += count
+    end = pos + length
+    if end > len(data):
+        fail("a TLV declared length overruns the actual content")
+    return tag, data[pos:end], data[start:end], end
+
+
+def parse_children(content):
+    children = []
+    pos = 0
+    while pos < len(content):
+        child = read_tlv(content, pos)
+        children.append(child)
+        pos = child[3]
+    if pos != len(content):
+        fail("a DER structure must end exactly at its declared length")
+    return children
+
+
+def parse_cert(path):
+    with open(path, "rb") as handle:
+        der = handle.read()
+    tag, content, _, end = read_tlv(der, 0)
+    if tag != 0x30 or end != len(der):
+        fail(f"{path}: outer SEQUENCE must span the whole file exactly")
+    children = parse_children(content)
+    if len(children) != 3:
+        fail(f"{path}: a certificate must have exactly 3 top-level elements")
+    if children[2][0] != 0x03:
+        fail(f"{path}: third element must be the signatureValue BIT STRING")
+    return der, children
+
+
+def read_pem_der(path):
+    lines = []
+    with open(path, "rb") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith(b"-----"):
+                continue
+            lines.append(line)
+    return base64.b64decode(b"".join(lines))
+
+
+# --- P-256 domain parameters (FIPS 186-4 / SEC 2) -------------------------
+P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+A = P - 3
+GX = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
+GY = 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5
+N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+G = (GX, GY)
+
+
+def point_add(point1, point2):
+    if point1 is None:
+        return point2
+    if point2 is None:
+        return point1
+    x1, y1 = point1
+    x2, y2 = point2
+    if x1 == x2 and (y1 + y2) % P == 0:
+        return None
+    if point1 == point2:
+        slope = (3 * x1 * x1 + A) * pow(2 * y1, P - 2, P) % P
+    else:
+        slope = (y2 - y1) * pow(x2 - x1, P - 2, P) % P
+    x3 = (slope * slope - x1 - x2) % P
+    y3 = (slope * (x1 - x3) - y1) % P
+    return x3, y3
+
+
+def scalar_mult(point, scalar):
+    result = None
+    addend = point
+    while scalar:
+        if scalar & 1:
+            result = point_add(result, addend)
+        addend = point_add(addend, addend)
+        scalar >>= 1
+    return result
+
+
+def parse_spki_point(spki_der, where):
+    tag, content, _, end = read_tlv(spki_der, 0)
+    if tag != 0x30 or end != len(spki_der):
+        fail(f"{where}: SubjectPublicKeyInfo must be one whole SEQUENCE")
+    parsed = parse_children(content)
+    if len(parsed) != 2 or parsed[1][0] != 0x03:
+        fail(f"{where}: unexpected SubjectPublicKeyInfo layout")
+    EC_ALGORITHM = bytes.fromhex("301306072a8648ce3d020106082a8648ce3d030107")
+    if parsed[0][2] != EC_ALGORITHM:
+        fail(f"{where}: key must be id-ecPublicKey with prime256v1 (P-256)")
+    bit_content = parsed[1][1]
+    if bit_content[0] != 0 or len(bit_content) != 66 or bit_content[1] != 0x04:
+        fail(f"{where}: EC point must be a 65-byte uncompressed point")
+    x = int.from_bytes(bit_content[2:34], "big")
+    y = int.from_bytes(bit_content[34:66], "big")
+    if not (0 < x < P and 0 < y < P):
+        fail(f"{where}: EC point coordinates out of range")
+    return x, y, bit_content[1:]
+
+
+ec_der, ec_children = parse_cert(sys.argv[1])
+bad_der, bad_children = parse_cert(sys.argv[2])
+
+# Only the signatureValue may differ: tbsCertificate and signatureAlgorithm
+# TLVs must be byte-identical between the normal and the corrupted cert.
+if ec_children[0][2] != bad_children[0][2]:
+    fail("the two certificates must share the same tbsCertificate bytes")
+if ec_children[1][2] != bad_children[1][2]:
+    fail("the two certificates must use the same signature algorithm TLV")
+if ec_children[2][1] == bad_children[2][1]:
+    fail("the signature content must differ between the two certificates")
+
+# ecdsa-with-SHA256 (1.2.840.10045.4.3.2) is the declared algorithm.
+ECDSA_SHA256_OID = bytes.fromhex("06082a8648ce3d040302")
+if ECDSA_SHA256_OID not in ec_children[1][1]:
+    fail("the EC fixtures must declare ecdsa-with-SHA256")
+
+# The corrupted certificate's signatureValue BIT STRING is itself complete:
+# zero unused bits, and as the last top-level element its whole TLV runs to
+# EOF (the outer SEQUENCE already spans the whole file, so the BIT STRING
+# TLV is the exact file suffix). The damage is confined INSIDE the value.
+bad_sig_tag, bad_sig_content, bad_sig_tlv, _ = bad_children[2]
+if bad_sig_content[0] != 0:
+    fail("the signature BIT STRING must have zero unused bits")
+if not bad_der.endswith(bad_sig_tlv):
+    fail("the signature BIT STRING TLV must end exactly at EOF")
+
+# Inside that complete BIT STRING: one complete SEQUENCE carrying exactly
+# ONE INTEGER. ECDSA-Sig-Value is a SEQUENCE of TWO INTEGERs, so this value
+# cannot be interpreted as a legal ECDSA signature -- a required INTEGER is
+# absent. The SEQUENCE must span the whole BIT STRING payload (the BIT
+# STRING is not merely truncated either).
+inner_tag, inner_content, _, inner_end = read_tlv(bad_sig_content, 1)
+if inner_tag != 0x30 or inner_end != len(bad_sig_content):
+    fail("the BIT STRING must contain one SEQUENCE spanning its whole payload")
+bad_integers = parse_children(inner_content)
+if len(bad_integers) != 1 or bad_integers[0][0] != 0x02:
+    fail("the inner signature must contain exactly one INTEGER (the second ECDSA INTEGER is missing)")
+if not bad_integers[0][1]:
+    fail("the surviving INTEGER must be non-empty")
+
+# The normal certificate's value is a legal, canonical two-INTEGER ECDSA
+# signature, and it really verifies under the independent issuer key.
+ec_sig_content = ec_children[2][1]
+ec_inner_tag, ec_inner_content, _, ec_inner_end = read_tlv(ec_sig_content, 1)
+if ec_inner_tag != 0x30 or ec_inner_end != len(ec_sig_content):
+    fail("the normal signature must be one whole SEQUENCE")
+ec_integers = parse_children(ec_inner_content)
+if len(ec_integers) != 2 or any(item[0] != 0x02 for item in ec_integers):
+    fail("a normal ECDSA signature must contain exactly two INTEGERs")
+values = []
+for _, raw, _, _ in ec_integers:
+    if not raw:
+        fail("ECDSA INTEGER must not be empty")
+    if len(raw) > 1 and raw[0] == 0 and not (raw[1] & 0x80):
+        fail("ECDSA INTEGER must be minimally encoded")
+    value = int.from_bytes(raw, "big")
+    if not 1 <= value < N:
+        fail("ECDSA r and s must be in the range [1, n-1]")
+    values.append(value)
+r, s = values
+
+tbs_children = parse_children(ec_children[0][1])
+if tbs_children[0][0] != 0xA0 or len(tbs_children) < 7:
+    fail("unexpected tbsCertificate layout")
+leaf_x, leaf_y, leaf_point = parse_spki_point(
+    tbs_children[6][2], sys.argv[1])
+issuer_der = read_pem_der(sys.argv[3])
+issuer_x, issuer_y, issuer_point = parse_spki_point(issuer_der, sys.argv[3])
+if issuer_point == leaf_point:
+    fail("the leaf must be signed by a DIFFERENT EC key, not its own key")
+
+tbs_tlv = ec_children[0][2]
+z = int.from_bytes(hashlib.sha256(tbs_tlv).digest(), "big")
+w = pow(s, N - 2, N)
+point1 = scalar_mult(G, z * w % N)
+point2 = scalar_mult((issuer_x, issuer_y), r * w % N)
+recovered = point_add(point1, point2)
+if recovered is None or recovered[0] % N != r:
+    fail("the normal ec certificate's ECDSA signature must verify")
+EOF
+        then
+            fail "the ec_badsign_inner fixture is not a complete certificate with a non-ECDSA signature"
+        fi
+        ;;
+
+    ec_badsign_inner_der_truncated)
+        # The rejection boundary next to the displayable corrupted-signature
+        # certificate: cut the OUTER layer INSIDE the signatureValue BIT
+        # STRING (its tag and length bytes stay on disk; trailing content
+        # bytes are removed), so the BIT STRING's declared length overruns
+        # the actual file. The regular file is still read in full, but this
+        # is format damage -- exit 1, empty stdout, an invalid-certificate
+        # diagnostic naming the path, never a read failure.
+        python3 - "$FIXTURES/ec_badsign_inner.der" "$TMP/trunc_sig.der" <<'EOF'
+import sys
+
+
+def fail(message):
+    print(f"test setup failed: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+der = open(sys.argv[1], "rb").read()
+if der[0] != 0x30:
+    fail("fixture must start with a SEQUENCE tag")
+pos = 1
+first = der[pos]
+pos += 1
+if first < 0x80:
+    outer_len = first
+else:
+    count = first & 0x7F
+    outer_len = int.from_bytes(der[pos:pos + count], "big")
+    pos += count
+outer_content_start = pos
+if pos + outer_len != len(der):
+    fail("the intact fixture's outer SEQUENCE must span the whole file")
+
+# Walk the three certificate children, recording absolute offsets.
+children = []
+for _ in range(3):
+    tlv_start = pos
+    tag = der[pos]
+    pos += 1
+    f = der[pos]
+    pos += 1
+    if f < 0x80:
+        length = f
+    else:
+        k = f & 0x7F
+        length = int.from_bytes(der[pos:pos + k], "big")
+        pos += k
+    content_start = pos
+    pos += length
+    children.append((tag, tlv_start, content_start, pos))
+if children[2][0] != 0x03:
+    fail("third element must be the signatureValue BIT STRING")
+_, bs_start, bs_content_start, bs_end = children[2]
+if bs_end != len(der):
+    fail("the BIT STRING must be the final element and reach EOF")
+content_len = bs_end - bs_content_start
+
+# Remove a handful of trailing bytes but keep the BIT STRING tag, its length
+# and at least the unused-bits byte plus one payload byte on disk. The
+# declared BIT STRING length then overruns the truncated file.
+drop = min(8, content_len - 2)
+if drop <= 0:
+    fail("signature BIT STRING too short to cut inside it")
+cut_len = len(der) - drop
+if not (bs_start < bs_content_start < cut_len < bs_end):
+    fail("the cut must land inside the BIT STRING content with its header intact")
+cut = der[:cut_len]
+if not der.startswith(cut) or len(cut) >= len(der):
+    fail("the truncated file must be a strict prefix of the intact one")
+open(sys.argv[2], "wb").write(cut)
+EOF
+        expect_invalid "$TMP/trunc_sig.der"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "an outer-truncated EC certificate is bad content, not a read failure"
+        ;;
+
+    ec_badsign_inner_pem_truncated)
+        # Same boundary carried in PEM: a COMPLETE single CERTIFICATE block
+        # (markers present, base64 decodes to the end) whose decoded body is
+        # the outer-truncated certificate -- the signatureValue BIT STRING's
+        # declared length overruns the actual DER content. A clean PEM
+        # envelope must not rescue a truncated certificate: exit 1, empty
+        # stdout, invalid-certificate diagnostic naming the path.
+        python3 - "$FIXTURES/ec_badsign_inner.der" "$TMP/trunc_sig.pem" <<'EOF'
+import base64
+import sys
+
+
+def fail(message):
+    print(f"test setup failed: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+der = open(sys.argv[1], "rb").read()
+if der[0] != 0x30:
+    fail("fixture must start with a SEQUENCE tag")
+pos = 1
+first = der[pos]
+pos += 1
+if first < 0x80:
+    outer_len = first
+else:
+    count = first & 0x7F
+    outer_len = int.from_bytes(der[pos:pos + count], "big")
+    pos += count
+if pos + outer_len != len(der):
+    fail("the intact fixture's outer SEQUENCE must span the whole file")
+
+children = []
+for _ in range(3):
+    tlv_start = pos
+    tag = der[pos]
+    pos += 1
+    f = der[pos]
+    pos += 1
+    if f < 0x80:
+        length = f
+    else:
+        k = f & 0x7F
+        length = int.from_bytes(der[pos:pos + k], "big")
+        pos += k
+    content_start = pos
+    pos += length
+    children.append((tag, tlv_start, content_start, pos))
+if children[2][0] != 0x03:
+    fail("third element must be the signatureValue BIT STRING")
+_, _, bs_content_start, bs_end = children[2]
+if bs_end != len(der):
+    fail("the BIT STRING must be the final element and reach EOF")
+content_len = bs_end - bs_content_start
+
+drop = min(8, content_len - 2)
+cut_len = len(der) - drop
+if not (bs_content_start < cut_len < bs_end):
+    fail("the cut must land inside the BIT STRING content")
+cut = der[:cut_len]
+
+# A well-formed, fully decodable single PEM block around the truncated body.
+body = base64.encodebytes(cut).decode("ascii")
+pem = (
+    "-----BEGIN CERTIFICATE-----\n"
+    + body
+    + "-----END CERTIFICATE-----\n"
+)
+# Self-check the envelope: one marker pair and base64 that decodes back to
+# exactly the truncated bytes (so rejection cannot be blamed on PEM damage).
+lines = [
+    line.strip()
+    for line in pem.splitlines()
+    if line and not line.startswith("-----")
+]
+if base64.b64decode("".join(lines)) != cut:
+    fail("the PEM body must decode back to the truncated DER exactly")
+open(sys.argv[2], "w").write(pem)
+EOF
+        expect_invalid "$TMP/trunc_sig.pem"
+        grep -q "failed to read file" "$TMP/stderr" &&
+            fail "an outer-truncated EC certificate in PEM is bad content, not a read failure"
         ;;
 
     der_marker_in_name)

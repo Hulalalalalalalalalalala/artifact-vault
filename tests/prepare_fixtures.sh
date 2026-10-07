@@ -76,6 +76,7 @@ reverseorder
 baddate
 ec
 ec_badsign
+ec_badsign_inner
 '
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/trustpeek-fixtures.XXXXXX") || {
@@ -129,6 +130,12 @@ done
 # UniversalString whose length is not a multiple of four) are the same: the
 # bytes are complete, canonical DER that decode cleanly here, and only
 # inspect's certificate parsing must reject them as invalid content.
+# ec_badsign_inner is complete canonical DER too: its outer X.509 structure
+# and signatureValue BIT STRING are whole, even though the DER SEQUENCE
+# inside that BIT STRING is missing one of the two INTEGERs ECDSA requires.
+# That is signature CONTENT inspect deliberately does not inspect (it
+# never verifies signatures), so this file must decode here exactly like
+# any other complete certificate.
 prepare_cert_der() {
     stem=$1
     pem="$SRC/$stem.pem"
